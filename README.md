@@ -37,7 +37,7 @@ Who owns which setting:
 | `A2A_DOMAIN` | yes | Public hostname. Must equal the host of the instance's `public_url` |
 | `A2A_SOCKET_DIR` | yes | Host path of that user's socket dir, e.g. `/var/lib/a2a-adapter/<user>` |
 | `A2A_API_KEY` | yes | `openssl rand -hex 32`. Lowercase hex, at least 32 chars, or the container refuses to start (exit 64) and Traefik has no route |
-| `TRAEFIK_NETWORK_NAME` | no | External Docker network Traefik watches. Default `traefik_proxy` |
+| `TRAEFIK_NETWORK_NAME` | no | External Docker network your Traefik routes over; the name differs per host, check it. Default `traefik_proxy`. How Traefik reads Docker (mounted `docker.sock` or a socket proxy) does not matter |
 | `TRAEFIK_CERTRESOLVER` | no | Default `letsencrypt` |
 
 Compose refuses to start if a required variable is unset or empty. One stack serves one (user, harness); for another pair deploy another stack (a different stack name gives a different router name).
@@ -73,6 +73,17 @@ Plus `HOME`, `PATH` and the CLI credential (`CLAUDE_CODE_OAUTH_TOKEN`, or an exi
 5. In the GitHub repo add the Actions secret `PORTAINER_REDEPLOY_HOOK` with that URL.
 
 On every push to `master`, `.github/workflows/deploy.yml` force-pushes `master` to the `deploy` branch and POSTs the webhook, which makes Portainer pull and redeploy. The workflow fails loudly if the secret is missing. The stack needs the external Traefik network to exist already.
+
+### Plain HTTP must not redirect
+
+A second router on the `web` entrypoint answers `Host(<A2A_DOMAIN>)` over plain HTTP itself (Traefik `noop@internal`, a 4xx with no `Location`) instead of letting a global web-to-websecure redirect send a `301`. With the redirect, an `http://` client still works, because Python `requests`/`httpx` keep `Authorization` on a same-host upgrade, while its key crosses the network in cleartext on every call. Failing loudly makes the misconfiguration visible. ACME HTTP-01 challenge paths are left alone, other hosts keep their redirect.
+
+This only takes effect if your core Traefik's redirect can be outranked:
+
+- **Entrypoint-level redirect** (`--entrypoints.web.http.redirections.entrypoint.to=websecure`): its generated router has priority `MaxInt-1` by default, and Traefik rejects user router priorities above `MaxInt-1000`, so no label can beat it. Set `--entrypoints.web.http.redirections.entrypoint.priority=1` on the core Traefik (`test/smoke.py` runs that setup). Side effect: any other stack's router on `web` then wins over the redirect for its host, so check none serves real traffic over HTTP by accident.
+- **Router-level redirect** (a catch-all router with a `redirectScheme` middleware): works as is unless its priority is `2147483647` or higher.
+
+Until then plain HTTP still `301`s to HTTPS and the key already crossed in cleartext. Clients must be configured with `https://` only.
 
 ## Manual install (without the Ansible role)
 
@@ -159,13 +170,14 @@ a2a() { curl -fsS -X POST "$A2A_URL/" -H "Authorization: Bearer $A2A_API_KEY" \
   '{jsonrpc:"2.0",id:1,method:"message/send",params:{message:{messageId:(now|tostring),role:"user",parts:[{kind:"text",text:$t}]}}}')"; }
 ```
 
-The key must match exactly: case-sensitive `Bearer`, no extra characters, right host, HTTPS only.
+The key must match exactly: case-sensitive `Bearer`, no extra characters, right host, HTTPS only. **Never configure a client with `http://`**: the key is sent before any server reply, so it is exposed even though the request fails (see [plain HTTP](#plain-http-must-not-redirect)).
 
 ## Threat model
 
 - **A leaked key is a remote shell.** With `A2A_YOLO` on (the default) the agent runs arbitrary commands as the host user with no approval step. If that user is in the `docker` group, that is root. Treat the key like an SSH key.
 - **There is no sandbox.** The CLI runs directly on the host with the user's files and credentials. The only host-side gate is the `0700` socket directory (uvicorn makes the socket itself `0666`).
-- **The key is not secret from the box.** It sits in the Traefik router-rule label and the container environment, so anyone who can `docker inspect` or use the Portainer UI can read it. Those users are already root-equivalent. Do not expose a Traefik dashboard/API that would show router rules.
+- **The key is not secret from the box.** It sits in the Traefik router-rule label and the container environment, so anyone who can `docker inspect` or use the Portainer UI can read it. Those users are already root-equivalent (accepted: the env copy only feeds the fail-closed format check). Do not expose a Traefik dashboard/API that would show router rules.
+- **Repeated `Authorization` headers**: Traefik's `Header()` matches if any one value matches, so `Bearer wrong` followed by `Bearer <key>` gets in. Accepted: the exact key is still required, it is not a bypass.
 - **One static bearer key**, no rate limiting, no per-client identity or audit trail beyond Traefik logs. Rotate by redeploying.
 - **Mitigations in place**: key format check fails closed; only the one user's socket dir is mounted, read-only; container has no published ports, all capabilities dropped but `CAP_DAC_READ_SEARCH`, read-only rootfs; HTTPS entrypoint only; wrong or missing key gets `404`.
 - To reduce risk set `A2A_YOLO=false` (the CLI then needs approvals it cannot get over A2A, so it will be much less useful) and use a dedicated low-privilege host user outside the `docker` group.
@@ -184,7 +196,7 @@ The key must match exactly: case-sensitive `Bearer`, no extra characters, right 
 1. `systemctl is-active a2a-adapter-<harness>@<user>` is `active` and the socket exists in the socket dir.
 2. Portainer: the stack's container is `healthy`. (Unhealthy makes Traefik drop the route, so clients see `404`.)
 3. With the key: the agent card returns `200`, and its `url` equals the `public_url`.
-4. Without the key, with a wrong key, and over plain `http://`: `404`.
+4. Without the key and with a wrong key: `404`. Over plain `http://` with the key: a 4xx with no `Location` header, or a `301` if the core Traefik's redirect cannot be outranked (see [plain HTTP](#plain-http-must-not-redirect)).
 5. A `message/send` round trip returns a reply.
 6. `ss -ltn` on the host shows no new TCP listener for the adapter.
 7. `docker inspect` of the container shows no published ports.

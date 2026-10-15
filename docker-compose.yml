@@ -58,6 +58,16 @@ services:
       - traefik.http.routers.${COMPOSE_PROJECT_NAME}.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}
       - traefik.http.routers.${COMPOSE_PROJECT_NAME}.service=${COMPOSE_PROJECT_NAME}
       - traefik.http.services.${COMPOSE_PROJECT_NAME}.loadbalancer.server.port=9000
+      # Plain HTTP for this host fails loudly (noop@internal, never forwards)
+      # instead of following a global web->websecure redirect, which would let
+      # an http:// client keep working while sending the key in cleartext.
+      # Wins over router-level redirects and an entrypoint redirect whose
+      # priority was lowered (README); a default-priority entrypoint redirect
+      # still wins, so then nothing changes. ACME HTTP-01 stays reachable.
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-http.rule=Host(`${A2A_DOMAIN}`) && !PathPrefix(`/.well-known/acme-challenge/`)
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-http.entrypoints=web
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-http.priority=2147483647
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-http.service=noop@internal
 
 networks:
   proxy:
