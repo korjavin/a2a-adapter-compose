@@ -29,6 +29,19 @@ services:
       - ${A2A_SOCKET_DIR}:/sock
     network_mode: none
 
+  fake-auth:
+    image: python:3.12-alpine@sha256:1b668429b3511ab407d8e00648891631b0b1a4d7e15e3ca70f38ab5b91ad4ab4
+    command: ["python", "-u", "/app/fake_auth.py"]
+    volumes:
+      - ./fake_auth.py:/app/fake_auth.py:ro
+    networks: [proxy]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${TRAEFIK_NETWORK_NAME}
+      - traefik.http.middlewares.test-auth.forwardauth.address=http://fake-auth:8080/auth
+      - traefik.http.middlewares.test-auth.forwardauth.authResponseHeaders=X-Forwarded-Email
+      - traefik.http.services.fake-auth.loadbalancer.server.port=8080
+
 networks:
   proxy:
     external: true

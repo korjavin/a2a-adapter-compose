@@ -253,3 +253,21 @@ The key must match exactly: case-sensitive `Bearer`, no extra characters, right 
 7. `docker inspect` of the container shows no published ports.
 
 `python3 test/smoke.py` runs an automated version of the gate checks against a throwaway Traefik and a fake adapter (needs Docker).
+
+## Optional dashboard ingress
+
+The stack includes an optional `a2a-dashboard` ingress service bridging Traefik to the read-only host dashboard service (`a2a-dashboard-<harness>@<user>.service`, listening on `<harness>-dash.sock` in `A2A_SOCKET_DIR`).
+
+- **OFF by default**: Guarded by `profiles: ["dashboard"]`. In Portainer 2.39 git stacks, stack environment variables are passed directly to Docker Compose, so setting `COMPOSE_PROFILES=dashboard` in the stack environment enables it without needing a second stack or webhook.
+- **Config**:
+  - `COMPOSE_PROFILES=dashboard`: enables the service.
+  - `A2A_DASH_DOMAIN`: public hostname for the dashboard (e.g. `dash.example.com`).
+  - `TRAEFIK_FORWARDAUTH_MIDDLEWARE`: name of the host's existing Traefik forwardAuth middleware (e.g. `forward-auth@docker`), optionally including `,auth-errors@docker`.
+  - `A2A_DASH_SOCKET_NAME`: optional, basename of the unix socket in `A2A_SOCKET_DIR` (defaults to `<harness>-dash.sock`).
+- **Hardening & Auth**:
+  - Pinned `alpine/socat`, root with only `CAP_DAC_READ_SEARCH` to traverse the `0700` socket dir, read-only rootfs, no published host ports.
+  - OIDC protection via the host's existing `forwardAuth` middleware. The host service enforces an email allowlist from `X-Forwarded-Email` (which forwardAuth overrides) and returns 403 for unauthorized users.
+  - The A2A API bearer key does not grant access to the dashboard, and dashboard OIDC cookies do not grant access to the A2A agent.
+  - Plain HTTP requests fail loudly (`noop@internal`, 4xx, no redirect), matching the A2A host router.
+  - Container healthcheck probes `GET /healthz` over the unix socket, which returns 200 without auth.
+
