@@ -1,6 +1,7 @@
 """Host wrapper: serve the host's claude or codex CLI as an A2A agent on a unix socket, configured by env."""
 
 import argparse
+import hmac
 import os
 import shlex
 import socket
@@ -44,6 +45,33 @@ def require_url(name):
     return value
 
 
+def require_api_key(name="A2A_API_KEY"):
+    """Same rule as the compose check: lowercase hex, >=32 chars. Fail closed otherwise."""
+    raw = os.environ.get(name, "")
+    if len(raw) < 32 or raw.strip("0123456789abcdef"):
+        sys.exit(f"{name} must be lowercase hex, at least 32 chars, the same key Traefik checks (fail closed)")
+    return raw
+
+
+def require_bearer(app, key):
+    """ASGI wrapper: refuse any request without "Authorization: Bearer <key>", like the Traefik router rule.
+    The socat bridge sits on the shared Traefik network, so a neighbour container can skip that rule."""
+    want = f"Bearer {key}".encode()
+
+    async def guarded(scope, receive, send):
+        # any matching value passes, as with Traefik's Header(); lifespan is not a request
+        if scope["type"] == "lifespan" or any(
+                name == b"authorization" and hmac.compare_digest(value, want) for name, value in scope["headers"]):
+            return await app(scope, receive, send)
+        if scope["type"] == "http":
+            await send({"type": "http.response.start", "status": 401,
+                        "headers": [(b"content-type", b"text/plain"), (b"www-authenticate", b"Bearer")]})
+            await send({"type": "http.response.body", "body": b"unauthorized\n"})
+        # anything else (websocket): never accepted, uvicorn rejects it
+
+    return guarded
+
+
 def require_private_dir(path):
     """uvicorn chmods the socket 0666 and A2A_YOLO means shell access: the dir is the only gate."""
     try:
@@ -80,12 +108,14 @@ def main():
     cwd = require_dir("A2A_CWD")
     state_dir = require_dir("A2A_STATE_DIR")
     sock = require("A2A_SOCKET")
+    api_key = require_api_key()
     require_private_dir(os.path.dirname(os.path.abspath(sock)))
     yolo = parse_bool("A2A_YOLO", True)
     timeout = int(os.environ.get("A2A_TIMEOUT", "600"))
     agent_args = shlex.split(os.environ.get("A2A_AGENT_ARGS", ""))
 
-    from a2a_adapter import build_agent_card, serve_agent
+    import uvicorn
+    from a2a_adapter import build_agent_card, to_a2a
     from a2a_adapter.cli import _validate_agent_args  # upstream managed-flag guard
 
     # exits 2 with a clear message if A2A_AGENT_ARGS touches a flag the adapter owns
@@ -124,13 +154,16 @@ def main():
     card = build_agent_card(adapter, url=public_url)
     clear_stale_socket(sock)
     print(f"Serving {harness} on unix:{sock}, card url {public_url}", flush=True)
-    serve_agent(adapter, agent_card=card, uds=sock)  # uds makes uvicorn ignore host/port
+    # serve_agent() minus the bare app: same to_a2a + uvicorn.run, wrapped in the key check
+    uvicorn.run(require_bearer(to_a2a(adapter, card), api_key), uds=sock, log_level="info")
 
 
 def self_check():
     import tempfile
 
-    names = ("A2A_HARNESS", "A2A_YOLO", "A2A_PUBLIC_URL", "A2A_CWD")
+    import asyncio
+
+    names = ("A2A_HARNESS", "A2A_YOLO", "A2A_PUBLIC_URL", "A2A_CWD", "A2A_API_KEY")
 
     def env(**kv):
         for k in names:
@@ -163,6 +196,37 @@ def self_check():
         assert exits(require_url, "A2A_PUBLIC_URL"), bad
     env(A2A_PUBLIC_URL="https://a2a.example.com/")
     assert require_url("A2A_PUBLIC_URL") == "https://a2a.example.com/"
+
+    key = "0123456789abcdef" * 2
+    for bad in (None, "", "ab" * 15, key.upper(), key + " ", key + ",x"):
+        env() if bad is None else env(A2A_API_KEY=bad)
+        assert exits(require_api_key), bad
+    env(A2A_API_KEY=key)
+    assert require_api_key() == key
+
+    async def inner(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+
+    guarded = require_bearer(inner, key)
+
+    def status(scope_type, *headers):
+        sent = []
+
+        async def send(msg):
+            sent.append(msg)
+
+        asyncio.run(guarded({"type": scope_type, "headers": list(headers)}, None, send))
+        return sent[0]["status"] if sent else None
+
+    auth, good = b"authorization", b"Bearer " + key.encode()
+    assert status("http") == 401
+    for bad in (good.upper(), b"bearer " + key.encode(), key.encode(), b"Bearer ", good + b"x", good[:-1]):
+        assert status("http", (auth, bad)) == 401, bad
+    assert status("http", (auth, good)) == 200
+    assert status("http", (auth, b"Bearer x"), (auth, good)) == 200  # any value matches, like Header()
+    assert status("http", (b"x-authorization", good)) == 401
+    assert status("websocket", (auth, b"Bearer x")) is None  # never reaches the app
+    assert status("lifespan") == 200
 
     with tempfile.TemporaryDirectory() as d:
         env()

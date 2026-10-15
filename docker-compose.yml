@@ -15,7 +15,7 @@ services:
     read_only: true
     environment:
       A2A_HARNESS: ${A2A_HARNESS:?set A2A_HARNESS to claude or codex}
-      # only read by the format check below, then dropped from socat's env
+      # read by the format check below (then dropped from socat's env) and by the healthcheck
       A2A_API_KEY: ${A2A_API_KEY:?set A2A_API_KEY (openssl rand -hex 32)}
     # Fail closed: a key outside [0-9a-f] could inject into the Traefik rule,
     # so the container (and with it the router) never comes up with one.
@@ -29,8 +29,9 @@ services:
         exec env -u A2A_API_KEY socat TCP-LISTEN:9000,fork,reuseaddr "UNIX-CONNECT:/sock/$$A2A_HARNESS.sock"
     # A real HTTP request through the bridge: unhealthy (socket missing, host
     # unit down) -> Traefik drops the router -> 404, never a dangling route.
+    # Sends the key: the host adapter refuses requests without it (a2a-tn2).
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/.well-known/agent-card.json"]
+      test: ["CMD-SHELL", "wget -q -O /dev/null --header \"Authorization: Bearer $$A2A_API_KEY\" http://127.0.0.1:9000/.well-known/agent-card.json"]
       interval: 10s
       timeout: 5s
       retries: 3

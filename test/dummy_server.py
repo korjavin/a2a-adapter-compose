@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler
 
 SOCK_DIR = "/sock"
 SOCK = os.path.join(SOCK_DIR, "claude.sock")
+API_KEY = os.environ["A2A_API_KEY"]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -24,12 +25,27 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def authorized(self):
+        """Mirrors entrypoint.py's require_bearer (unit-tested in its --self-check): every request needs the key."""
+        if f"Bearer {API_KEY}" in self.headers.get_all("Authorization", []):
+            return True
+        self.send_response(401)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        return False
+
     def do_GET(self):
+        if not self.authorized():
+            return
         if self.path == "/.well-known/agent-card.json":
             return self.send_json({"name": "dummy", "url": "https://a2a.test/"})
         self.send_error(404)
 
     def do_POST(self):
+        if not self.authorized():
+            return
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if req["method"] == "message/stream":
             self.send_response(200)

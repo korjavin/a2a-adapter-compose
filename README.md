@@ -8,7 +8,7 @@ Serve a host user's own `claude` or `codex` CLI as an [A2A](https://github.com/h
 
 ```
 client --HTTPS--> Traefik --Header(Authorization: Bearer <key>)--> socat :9000
-   --> /sock/<harness>.sock (bind mount, read-only) --> a2a-adapter-<harness>@<user> (host systemd unit)
+   --> /sock/<harness>.sock (bind mount, read-only) --> a2a-adapter-<harness>@<user> (host systemd unit, checks the same key)
 ```
 
 Two independent lifecycles:
@@ -27,7 +27,7 @@ Who owns which setting:
 | Setting | Owner |
 |---|---|
 | `A2A_API_KEY`, `A2A_DOMAIN`, `A2A_HARNESS`, `A2A_SOCKET_DIR`, `TRAEFIK_NETWORK_NAME`, `TRAEFIK_CERTRESOLVER` | Portainer stack environment (see [`.env.example`](.env.example)) |
-| user, harness, `public_url`, workspace `cwd`, agent args, `yolo`, CLI credentials | Ansible vars (or the host env file) |
+| user, harness, `public_url`, workspace `cwd`, agent args, `yolo`, CLI credentials, `A2A_API_KEY` (same value as Portainer's) | Ansible vars (or the host env file) |
 
 ### Ingress env (Portainer)
 
@@ -51,6 +51,7 @@ Compose refuses to start if a required variable is unset or empty. One stack ser
 | `A2A_CWD` | yes | Existing directory the CLI works in |
 | `A2A_STATE_DIR` | yes | Existing directory for the session map |
 | `A2A_SOCKET` | yes | Socket path. Its directory must be owned by the running user, mode `0700` (checked at startup) |
+| `A2A_API_KEY` | yes | The same key as the Portainer `A2A_API_KEY`. Every request must carry `Authorization: Bearer <key>` or gets `401`; the unit refuses to start unless it is lowercase hex, at least 32 chars |
 | `A2A_YOLO` | no | Default `true`: skip permissions (claude) / bypass approvals (codex). `false` to disable |
 | `A2A_TIMEOUT` | no | Seconds, default `600` |
 | `A2A_AGENT_ARGS` | no | Extra CLI args, shell-split; flags the adapter owns are rejected |
@@ -62,7 +63,8 @@ Plus `HOME`, `PATH` and the CLI credential (`CLAUDE_CODE_OAUTH_TOKEN`, or an exi
 
 - **New domain**: the card URL is built at host startup, so update `public_url` in Ansible and re-run, and `A2A_DOMAIN` in Portainer. Both must match.
 - **Harness switch** (`claude` to `codex`): change `A2A_HARNESS` in Portainer and make sure the other instance exists on the host. Task stores are separate in-memory stores, so tasks do not migrate. Drain running tasks first.
-- **Key rotation**: change `A2A_API_KEY` in Portainer and redeploy. The old key stops working as soon as Traefik picks up the new labels.
+- **Key rotation**: change `A2A_API_KEY` in the host env (re-run the role, or edit and restart the unit) and in Portainer (redeploy). Requests fail (`401`, or `404` at Traefik) until both match; the ingress healthcheck sends the key too, so the router drops until they do.
+- **Upgrading from before the host key check**: redeploy the stack first (its healthcheck now sends the key, which an old host ignores), then add `A2A_API_KEY` to the host env and update `entrypoint.py` (one role run, or env first). An updated `entrypoint.py` without the key in its env refuses to start.
 
 ## Portainer git stack
 
@@ -109,6 +111,7 @@ A2A_PUBLIC_URL="https://a2a.example.com/"
 A2A_CWD="/srv/work/project"
 A2A_STATE_DIR="/var/lib/a2a-adapter/alice/state"
 A2A_SOCKET="/var/lib/a2a-adapter/alice/claude.sock"
+A2A_API_KEY="..."   # the Portainer A2A_API_KEY
 # claude only, if there is no existing ~/.claude login:
 # CLAUDE_CODE_OAUTH_TOKEN="..."
 ```
@@ -228,12 +231,12 @@ The key must match exactly: case-sensitive `Bearer`, no extra characters, right 
 ## Threat model
 
 - **A leaked key is a remote shell.** With `A2A_YOLO` on (the default) the agent runs arbitrary commands as the host user with no approval step. If that user is in the `docker` group, that is root. Treat the key like an SSH key.
-- **There is no sandbox.** The CLI runs directly on the host with the user's files and credentials. The only host-side gate is the `0700` socket directory (uvicorn makes the socket itself `0666`).
-- **The key is not secret from the box.** It sits in the Traefik router-rule label and the container environment, so anyone who can `docker inspect` or use the Portainer UI can read it. Those users are already root-equivalent (accepted: the env copy only feeds the fail-closed format check). Do not expose a Traefik dashboard/API that would show router rules.
+- **There is no sandbox.** The CLI runs directly on the host with the user's files and credentials. The host-side gates are the `0700` socket directory (uvicorn makes the socket itself `0666`) and the adapter's own bearer-key check.
+- **The key is not secret from the box.** It sits in the Traefik router-rule label, the container environment (format check and healthcheck) and the root-only host env file, so anyone who can `docker inspect`, use the Portainer UI or read `/etc/a2a-adapter` can read it. Those users are already root-equivalent (accepted). Do not expose a Traefik dashboard/API that would show router rules.
 - **Repeated `Authorization` headers**: Traefik's `Header()` matches if any one value matches, so `Bearer wrong` followed by `Bearer <key>` gets in. Accepted: the exact key is still required, it is not a bypass.
-- **Known open issue: neighbour containers bypass the key gate** (tracked in bead `a2a-tn2`, fix in progress). The key is checked only by Traefik's router rule; the socat bridge listens on `:9000` on the shared external Traefik network and the host adapter does no auth of its own. Any container attached to that network can call `http://<container>:9000/` directly with no key, which is a shell as the host user. Until it is fixed, run only trusted containers on the Traefik network. (The dashboard closes the same hole with a router-stamped secret header, `A2A_DASH_SECRET`.)
+- **Neighbour containers**: the socat bridge listens on `:9000` on the shared external Traefik network, so any container attached to it can skip Traefik and call `http://<container>:9000/` directly. The host adapter therefore checks the same bearer key itself (constant-time compare, every path, refuses to start without a valid key): a direct call without the right key gets `401`. (The dashboard closes the same hole with a router-stamped secret header, `A2A_DASH_SECRET`.) A neighbour that sniffs or holds the key is no different from any other key holder.
 - **One static bearer key**, no rate limiting, no per-client identity or audit trail beyond Traefik logs. Rotate by redeploying.
-- **Mitigations in place**: key format check fails closed; only the one user's socket dir is mounted, read-only; container has no published ports, all capabilities dropped but `CAP_DAC_READ_SEARCH`, read-only rootfs; HTTPS entrypoint only; wrong or missing key gets `404`.
+- **Mitigations in place**: key format check fails closed (ingress and host); host re-checks the key; only the one user's socket dir is mounted, read-only; container has no published ports, all capabilities dropped but `CAP_DAC_READ_SEARCH`, read-only rootfs; HTTPS entrypoint only; wrong or missing key gets `404`.
 - To reduce risk set `A2A_YOLO=false` (the CLI then needs approvals it cannot get over A2A, so it will be much less useful) and use a dedicated low-privilege host user outside the `docker` group.
 
 ## Known limits
