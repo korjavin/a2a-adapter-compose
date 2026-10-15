@@ -1,5 +1,5 @@
-# pip freeze of a2a-adapter==0.2.13 on python:3.12-slim-bookworm (a2a-adapter itself
-# is pinned by the A2A_ADAPTER_VERSION build-arg). Regenerate when bumping it.
+# Pin set for the host venv: uv pip install -c constraints.txt a2a-adapter==0.2.13
+# (pip freeze of that install on python 3.12). Regenerate when bumping a2a-adapter.
 a2a-sdk==1.2.2
 aiologic==0.17.1
 annotated-types==0.8.0
