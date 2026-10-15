@@ -69,6 +69,62 @@ services:
       - traefik.http.routers.${COMPOSE_PROJECT_NAME}-http.priority=2147483647
       - traefik.http.routers.${COMPOSE_PROJECT_NAME}-http.service=noop@internal
 
+  a2a-dashboard:
+    profiles: ["dashboard"]
+    image: alpine/socat:1.8.0.3@sha256:beb4a68d9e4fe6b0f21ea774a0fde6c31f580dde6368939ed70100c5385b015e
+    init: true
+    restart: unless-stopped
+    # Same hardening as a2a-ingress: root with only CAP_DAC_READ_SEARCH
+    # to traverse the 0700 socket dir, ro rootfs, no published ports.
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [DAC_READ_SEARCH]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    environment:
+      A2A_HARNESS: ${A2A_HARNESS:?set A2A_HARNESS to claude or codex}
+      A2A_DASH_DOMAIN: ${A2A_DASH_DOMAIN:-}
+      A2A_DASH_SOCKET_NAME: ${A2A_DASH_SOCKET_NAME:-}
+      TRAEFIK_FORWARDAUTH_MIDDLEWARE: ${TRAEFIK_FORWARDAUTH_MIDDLEWARE:-}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        case "$$A2A_HARNESS" in claude|codex) ;; *) echo "A2A_HARNESS must be claude or codex" >&2; exit 64;; esac
+        [ -n "$$A2A_DASH_DOMAIN" ] || { echo "A2A_DASH_DOMAIN must be set" >&2; exit 64; }
+        [ -n "$$TRAEFIK_FORWARDAUTH_MIDDLEWARE" ] || { echo "TRAEFIK_FORWARDAUTH_MIDDLEWARE must be set" >&2; exit 64; }
+        DASH_SOCK="$${A2A_DASH_SOCKET_NAME:-$${A2A_HARNESS}-dash.sock}"
+        case "$$DASH_SOCK" in */*|..*) echo "A2A_DASH_SOCKET_NAME must be a bare filename" >&2; exit 64;; esac
+        exec socat TCP-LISTEN:9000,fork,reuseaddr "UNIX-CONNECT:/sock/$$DASH_SOCK"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+      start_interval: 2s
+    volumes:
+      - type: bind
+        source: ${A2A_SOCKET_DIR:?set A2A_SOCKET_DIR, e.g. /var/lib/a2a-adapter/<user>}
+        target: /sock
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [proxy]
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${TRAEFIK_NETWORK_NAME:-traefik_proxy}
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-dash.rule=Host(`${A2A_DASH_DOMAIN:-}`)
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-dash.entrypoints=websecure
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-dash.tls=true
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-dash.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-dash.middlewares=${TRAEFIK_FORWARDAUTH_MIDDLEWARE:-}
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-dash.service=${COMPOSE_PROJECT_NAME}-dash
+      - traefik.http.services.${COMPOSE_PROJECT_NAME}-dash.loadbalancer.server.port=9000
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-dash-http.rule=Host(`${A2A_DASH_DOMAIN:-}`) && !PathPrefix(`/.well-known/acme-challenge/`)
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-dash-http.entrypoints=web
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-dash-http.priority=2147483647
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-dash-http.service=noop@internal
+
 networks:
   proxy:
     external: true

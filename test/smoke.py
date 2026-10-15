@@ -17,6 +17,7 @@ MAIN = os.path.join(HERE, "..", "docker-compose.yml")
 RIG = os.path.join(HERE, "compose.test.yml")
 NET = "a2a_smoke_proxy"
 DOMAIN = "a2a.test"
+DASH_DOMAIN = "a2a-dash.test"
 KEY = secrets.token_hex(32)
 SOCK_DIR = tempfile.mkdtemp(prefix="a2a-smoke-", dir="/tmp")
 BASE_ENV = dict(os.environ, A2A_HARNESS="claude", A2A_DOMAIN=DOMAIN, A2A_SOCKET_DIR=SOCK_DIR,
@@ -31,8 +32,8 @@ def sh(*args, env=None, check=True):
     return r
 
 
-def ingress(*args, **env):
-    return sh("docker", "compose", "-p", "a2a-smoke", "-f", MAIN, *args, env=dict(BASE_ENV, **env))
+def ingress(*args, check=True, **env):
+    return sh("docker", "compose", "-p", "a2a-smoke", "-f", MAIN, *args, env=dict(BASE_ENV, **env), check=check)
 
 
 def rig(*args):
@@ -45,20 +46,24 @@ def expect(name, ok, detail=""):
         failures.append(name)
 
 
-def request(method="GET", path="/.well-known/agent-card.json", auth=None, body=None, host=DOMAIN,
-            tls=True, timeout=15):
+def request(method="GET", path="/.well-known/agent-card.json", auth=None, cookie=None, headers=None,
+            body=None, host=DOMAIN, tls=True, timeout=15):
     if tls:
         conn = http.client.HTTPSConnection("127.0.0.1", 18443, timeout=timeout,
                                            context=ssl._create_unverified_context())
     else:
         conn = http.client.HTTPConnection("127.0.0.1", 18080, timeout=timeout)
-    headers = {"Host": host}
+    req_headers = {"Host": host}
+    if headers:
+        req_headers.update(headers)
     if auth is not None:
-        headers["Authorization"] = auth
+        req_headers["Authorization"] = auth
+    if cookie is not None:
+        req_headers["Cookie"] = cookie
     if body is not None:
         body = json.dumps(body)
-        headers["Content-Type"] = "application/json"
-    conn.request(method, path, body=body, headers=headers)
+        req_headers["Content-Type"] = "application/json"
+    conn.request(method, path, body=body, headers=req_headers)
     resp = conn.getresponse()
     return resp.status, resp.read().decode(errors="replace"), resp.getheader("Location")
 
@@ -92,9 +97,11 @@ def config_checks():
 
 def main():
     config_checks()
+    ingress("--profile", "*", "down", "-t", "1", check=False)
     sh("docker", "network", "create", NET, check=False)
     rig("up", "-d")
     expect("fake host serving", wait_for(lambda: "serving" in rig("logs", "fake-host").stdout, 30))
+    expect("fake auth serving", wait_for(lambda: "serving" in rig("logs", "fake-auth").stdout, 30))
     good = f"Bearer {KEY}"
     if sys.platform == "linux":  # Docker Desktop's file sharing ignores host permissions
         # the dir really is private: root without capabilities can't traverse it (CAP_DAC_READ_SEARCH lets ingress in)
@@ -114,6 +121,11 @@ def main():
     expect("router up with the right key", wait_for(lambda: request(auth=good)[0] == 200, 60))
     ports = sh("docker", "inspect", "-f", "{{json .HostConfig.PortBindings}}", "a2a-smoke-a2a-ingress-1").stdout.strip()
     expect("ingress publishes no host ports", ports in ("{}", "null"), ports)
+
+    # Dashboard is OFF by default when COMPOSE_PROFILES is unset
+    expect("dash off by default: 404", request(path="/", host=DASH_DOMAIN)[0] == 404)
+    running_dash = sh("docker", "ps", "--filter", "name=a2a-smoke-a2a-dashboard", "--filter", "status=running", "-q").stdout.strip()
+    expect("dash container not running by default", running_dash == "")
 
     other = secrets.token_hex(32)
     denied = {
@@ -161,17 +173,79 @@ def main():
         status, body, _ = request("POST", "/", auth=good, body=rpc("slow", {"seconds": 65}), timeout=90)
         expect("65s request completes", status == 200, (status, body[:200]))
 
+    # Now enable dashboard profile and verify its validation, hardening, and auth matrix
+    dash_env = dict(COMPOSE_PROFILES="dashboard", A2A_DASH_DOMAIN=DASH_DOMAIN,
+                    TRAEFIK_FORWARDAUTH_MIDDLEWARE="test-auth@docker")
+    # Fail-closed checks on required dashboard env vars
+    for missing_var in ("A2A_DASH_DOMAIN", "TRAEFIK_FORWARDAUTH_MIDDLEWARE"):
+        ingress("up", "-d", **dict(dash_env, **{missing_var: ""}))
+        time.sleep(3)
+        state = sh("docker", "inspect", "-f", "{{.State.ExitCode}} {{.State.Health.Status}}",
+                   "a2a-smoke-a2a-dashboard-1", check=False).stdout.strip()
+        expect(f"dash container fails closed without {missing_var}", state.split()[:1] == ["64"], state)
+
+    ingress("up", "-d", **dash_env)
+    expect("dash router up and healthy",
+           wait_for(lambda: request(path="/", host=DASH_DOMAIN, cookie="dash_auth=owner@example.com")[0] == 200, 60))
+    dash_ports = sh("docker", "inspect", "-f", "{{json .HostConfig.PortBindings}}", "a2a-smoke-a2a-dashboard-1").stdout.strip()
+    expect("dashboard publishes no host ports", dash_ports in ("{}", "null"), dash_ports)
+
+    # Auth matrix:
+    # 1. no cookie -> 401/redirect
+    status, _, loc = request(path="/", host=DASH_DOMAIN)
+    expect("dash, no cookie: 401", status == 401 or (status in (301, 302, 307, 308) and loc), (status, loc))
+
+    # 2. allowlisted cookie -> 200
+    status, body, _ = request(path="/", host=DASH_DOMAIN, cookie="dash_auth=owner@example.com")
+    expect("dash, allowlisted cookie: 200", status == 200 and "dashboard" in body, (status, body))
+
+    # allowlisted cookie (case-insensitive) -> 200
+    status, body, _ = request(path="/", host=DASH_DOMAIN, cookie="dash_auth=OWNER@EXAMPLE.COM")
+    expect("dash, allowlisted cookie case-insensitive: 200", status == 200 and "dashboard" in body, (status, body))
+
+    # 3. non-allowlisted cookie -> 403
+    status, body, _ = request(path="/", host=DASH_DOMAIN, cookie="dash_auth=intruder@example.com")
+    expect("dash, non-allowlisted cookie: 403", status == 403, (status, body))
+
+    # 4. A2A bearer key alone -> denied on the dash host
+    status, body, _ = request(path="/", host=DASH_DOMAIN, auth=good)
+    expect("dash, A2A bearer key alone: denied (401)", status == 401, (status, body))
+
+    # 5. dash cookie -> 404 on the a2a host
+    status, body, _ = request(path="/.well-known/agent-card.json", host=DOMAIN, cookie="dash_auth=owner@example.com")
+    expect("dash cookie on a2a host: 404", status == 404, (status, body))
+
+    # Forged X-Forwarded-Email without cookie -> 401 (cannot bypass forwardAuth)
+    status, _, _ = request(path="/", host=DASH_DOMAIN, headers={"X-Forwarded-Email": "owner@example.com"})
+    expect("dash, forged X-Forwarded-Email without cookie: 401", status == 401, status)
+
+    # Forged X-Forwarded-Email overridden by forwardAuth with non-allowlisted user -> 403
+    status, _, _ = request(path="/", host=DASH_DOMAIN, cookie="dash_auth=intruder@example.com",
+                           headers={"X-Forwarded-Email": "owner@example.com"})
+    expect("dash, forged X-Forwarded-Email overridden: 403", status == 403, status)
+
+    # Plain HTTP on dash host: fails loudly (4xx, no Location redirect)
+    status, _, location = request(path="/", host=DASH_DOMAIN, cookie="dash_auth=owner@example.com", tls=False)
+    expect("dash over plain HTTP: 4xx, no redirect", 400 <= status < 500 and location is None, (status, location))
+
+    # Internal healthcheck probe endpoint (/healthz) works over unix socket
+    status, body, _ = request(path="/healthz", host=DASH_DOMAIN, cookie="dash_auth=owner@example.com")
+    expect("dash /healthz: 200 ok", status == 200 and "ok" in body, (status, body))
+
     # host unit restart: new socket inode in the same dir, ingress untouched
     rig("restart", "fake-host")
-    expect("request works after host restart, no redeploy", wait_for(lambda: request(auth=good)[0] == 200, 15))
+    expect("a2a works after host restart, no redeploy", wait_for(lambda: request(auth=good)[0] == 200, 15))
+    expect("dash works after host restart, no redeploy",
+           wait_for(lambda: request(path="/", host=DASH_DOMAIN, cookie="dash_auth=owner@example.com")[0] == 200, 15))
 
 
 if __name__ == "__main__":
     try:
         main()
     finally:
-        sh("docker", "compose", "-p", "a2a-smoke", "-f", MAIN, "down", "-t", "1", check=False)
+        ingress("--profile", "*", "down", "-t", "1", check=False)
         rig("down", "-t", "1")
         sh("docker", "network", "rm", NET, check=False)
     print(f"\n{len(failures)} failure(s)" + (": " + ", ".join(failures) if failures else ""))
     sys.exit(1 if failures else 0)
+
