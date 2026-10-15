@@ -9,6 +9,7 @@ import http.server
 import json
 import os
 import pwd
+import re
 import shlex
 import socket
 import socketserver
@@ -16,6 +17,9 @@ import subprocess
 import sys
 import time
 import urllib.parse
+
+# Units run with `python -I` which drops script dir from sys.path; restore it explicitly
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from entrypoint import HARNESSES, clear_stale_socket, require, require_dir, require_private_dir
 
@@ -103,8 +107,13 @@ def get_recent_errors(harness: str, user: str | None = None) -> str:
         return f"failed to read journal: {e}"
 
 
+def get_claude_transcript_slug(cwd: str) -> str:
+    # Claude CLI slug rule: replaces every non-alphanumeric character with '-'
+    return re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(cwd))
+
+
 def get_claude_transcript_path(cwd: str, session_id: str, home: str | None = None) -> str:
-    slug = os.path.abspath(cwd).replace("/", "-")
+    slug = get_claude_transcript_slug(cwd)
     home_dir = home or os.environ.get("HOME", os.path.expanduser("~"))
     return os.path.join(home_dir, ".claude", "projects", slug, f"{session_id}.jsonl")
 
@@ -662,13 +671,17 @@ def self_check():
     assert exits(parse_allowed_emails, "   ")
     assert exits(parse_allowed_emails, ",,,")
 
-    # 2. Fixture setup
+    # 2. Slug calculation test (non-alphanumeric replacement for dots, underscores, slashes)
+    assert get_claude_transcript_slug("/srv/my_repo.v1") == "-srv-my-repo-v1"
+    assert get_claude_transcript_slug("/path.with.dots/and_underscores") == "-path-with-dots-and-underscores"
+
+    # 3. Fixture setup with punctuated directory name
     with tempfile.TemporaryDirectory() as d:
         os.chmod(d, 0o700)
         sock_path = os.path.join(d, "dash.sock")
         state_dir = os.path.join(d, "state")
         os.makedirs(state_dir, exist_ok=True)
-        cwd_dir = os.path.join(d, "repo")
+        cwd_dir = os.path.join(d, "repo_work.v1")
         os.makedirs(cwd_dir, exist_ok=True)
         home_dir = os.path.join(d, "home")
         os.makedirs(home_dir, exist_ok=True)
@@ -681,8 +694,9 @@ def self_check():
         with open(os.path.join(state_dir, "claude-sessions.json"), "w") as f:
             json.dump(sessions_data, f)
 
-        # Fixture transcripts
-        proj_slug = os.path.abspath(cwd_dir).replace("/", "-")
+        # Fixture transcripts using slug rule
+        proj_slug = get_claude_transcript_slug(cwd_dir)
+        assert "_" not in proj_slug and "." not in proj_slug
         transcript_dir = os.path.join(home_dir, ".claude", "projects", proj_slug)
         os.makedirs(transcript_dir, exist_ok=True)
 
@@ -845,6 +859,16 @@ def self_check():
         assert st == 200, f"Expected 200 for /healthz unauthenticated, got {st}"
         assert body.strip() == "ok", f"Expected 'ok' for /healthz, got {body!r}"
 
+        # Test 8: Subprocess invocation with python3 -I (verifies sys.path restoration without script dir)
+        r = subprocess.run(
+            [sys.executable, "-I", os.path.abspath(__file__), "--smoke-check-import"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert r.returncode == 0, f"Failed when launched with python3 -I: {r.stderr}"
+        assert "smoke-check-import ok" in r.stdout
+
         server.shutdown()
         server.server_close()
 
@@ -871,7 +895,9 @@ def main():
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["--self-check"]:
+    if sys.argv[1:] == ["--smoke-check-import"]:
+        print("smoke-check-import ok", flush=True)
+    elif sys.argv[1:] == ["--self-check"]:
         self_check()
     else:
         main()
