@@ -12,4 +12,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: python3 entrypoint.py --self-check
+      - run: python3 dashboard.py --self-check
       - run: python3 test/smoke.py
