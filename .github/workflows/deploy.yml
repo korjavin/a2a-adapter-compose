@@ -1,0 +1,41 @@
+name: Deploy a2a-adapter stack
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+# Serialize deploys; never cancel one mid force-push/webhook.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Only master may publish the deploy branch (dispatch from other refs is skipped).
+    if: github.ref == 'refs/heads/master'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create/Update deploy branch
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git checkout -B deploy
+          git push origin deploy --force
+
+      - name: Trigger Portainer redeploy webhook
+        env:
+          HOOK: ${{ secrets.PORTAINER_REDEPLOY_HOOK }}
+        run: |
+          if [ -z "$HOOK" ]; then
+            echo "::error::PORTAINER_REDEPLOY_HOOK secret is not set; deploy branch updated but Portainer was not triggered"
+            exit 1
+          fi
+          curl -fsS --retry 3 -X POST "$HOOK" > /dev/null
