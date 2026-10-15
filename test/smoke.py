@@ -85,6 +85,19 @@ def wait_for(fn, seconds):
     return False
 
 
+A2A_URL = "http://a2a-smoke-a2a-ingress-1:9000"
+DASH_URL = "http://a2a-smoke-a2a-dashboard-1:9000/"
+
+
+def neighbour(url, *headers, body=None):
+    """A container on the shared Traefik network calling a socat bridge directly, skipping Traefik."""
+    args = [a for h in headers for a in ("--header", h)]
+    if body is not None:
+        args += ["--header", "Content-Type: application/json", "--post-data", json.dumps(body)]
+    return sh("docker", "run", "--rm", "--network", NET, "--entrypoint", "wget", "alpine/socat:1.8.0.3",
+              "-q", "-S", "-O", "-", *args, url, check=False)
+
+
 def config_checks():
     for var in ("A2A_API_KEY", "A2A_DOMAIN", "A2A_SOCKET_DIR", "A2A_HARNESS"):
         for label, env in (("unset", {k: v for k, v in BASE_ENV.items() if k != var}), ("empty", {**BASE_ENV, var: ""})):
@@ -161,6 +174,19 @@ def main():
     status, body, _ = request("POST", "/", auth=good, body=rpc("message/send"))
     expect("JSON-RPC with key: 200", status == 200 and "message/send" in body, body)
 
+    # The host adapter checks the bearer key itself (a2a-tn2): a neighbour container calling the socat bridge
+    # directly, skipping Traefik's Header() rule, needs the same key a client sends.
+    for name, headers in (("no key", ()), ("wrong key", (f"Authorization: Bearer {other}",)),
+                          ("key without scheme", (f"Authorization: {KEY}",))):
+        for what, path, body in (("agent card", "/.well-known/agent-card.json", None),
+                                 ("JSON-RPC", "/", rpc("message/send"))):
+            r = neighbour(A2A_URL + path, *headers, body=body)
+            expect(f"a2a, neighbour direct {what}, {name}: 401", r.returncode != 0 and " 401" in r.stderr,
+                   (r.returncode, r.stderr.strip()))
+    r = neighbour(A2A_URL + "/", f"Authorization: {good}", body=rpc("message/send"))
+    expect("a2a, neighbour direct with the right key: 200 (control)", r.returncode == 0 and "message/send" in r.stdout,
+           (r.returncode, r.stderr.strip()))
+
     conn = http.client.HTTPSConnection("127.0.0.1", 18443, timeout=15, context=ssl._create_unverified_context())
     start = time.time()
     conn.request("POST", "/", body=json.dumps(rpc("message/stream")),
@@ -229,18 +255,14 @@ def main():
 
     # A neighbour container on the shared Traefik network skips Traefik and forwardAuth by calling the
     # socat bridge directly with a forged email: denied, it cannot know the router-stamped secret.
-    def neighbour(*headers):
-        args = [a for h in headers for a in ("--header", h)]
-        return sh("docker", "run", "--rm", "--network", NET, "--entrypoint", "wget", "alpine/socat:1.8.0.3",
-                  "-q", "-S", "-O", "-", *args, "http://a2a-smoke-a2a-dashboard-1:9000/", check=False)
-    r = neighbour("X-Forwarded-Email: owner@example.com")
+    r = neighbour(DASH_URL, "X-Forwarded-Email: owner@example.com")
     expect("dash, neighbour direct to socat with forged email: 403", r.returncode != 0 and " 403" in r.stderr,
            (r.returncode, r.stderr.strip()))
-    r = neighbour("X-Forwarded-Email: owner@example.com", "X-A2A-Dash-Secret: " + secrets.token_hex(32))
+    r = neighbour(DASH_URL, "X-Forwarded-Email: owner@example.com", "X-A2A-Dash-Secret: " + secrets.token_hex(32))
     expect("dash, neighbour direct with a guessed secret: 403", r.returncode != 0 and " 403" in r.stderr,
            (r.returncode, r.stderr.strip()))
     # control: the 403s above come from the secret check, not from an unreachable bridge
-    r = neighbour("X-Forwarded-Email: owner@example.com", "X-A2A-Dash-Secret: " + DASH_SECRET)
+    r = neighbour(DASH_URL, "X-Forwarded-Email: owner@example.com", "X-A2A-Dash-Secret: " + DASH_SECRET)
     expect("dash, direct with the router secret: 200 (control)", r.returncode == 0 and "dashboard" in r.stdout,
            (r.returncode, r.stderr.strip()))
 

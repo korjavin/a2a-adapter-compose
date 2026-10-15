@@ -26,6 +26,7 @@ services:
     command: ["python", "-u", "/app/dummy_server.py"]
     environment:
       A2A_DASH_SECRET: ${A2A_DASH_SECRET:?}
+      A2A_API_KEY: ${A2A_API_KEY:?}
     volumes:
       - ./dummy_server.py:/app/dummy_server.py:ro
       - ${A2A_SOCKET_DIR}:/sock
