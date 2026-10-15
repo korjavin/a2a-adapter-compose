@@ -141,6 +141,57 @@ journalctl -u a2a-adapter-claude@alice -n 20     # "Serving claude on unix:..."
 
 Then create the Portainer stack as above with `A2A_SOCKET_DIR=/var/lib/a2a-adapter/alice`. `entrypoint.py --self-check` runs the wrapper's offline tests.
 
+## Dashboard host service
+
+A host-side, read-only HTTP service (`dashboard.py`) showing active sessions, running requests, and recent unit errors.
+
+### Dashboard env
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `A2A_HARNESS` | yes | `claude` or `codex` |
+| `A2A_CWD` | yes | Existing directory the CLI works in |
+| `A2A_STATE_DIR` | yes | Existing directory for the session map |
+| `A2A_DASH_SOCKET` | yes | Socket path for the dashboard, e.g. `/var/lib/a2a-adapter/<user>/dash.sock` in the same `0700` socket dir |
+| `A2A_DASH_ALLOWED_EMAILS` | yes | Comma-separated list of allowed emails (case-insensitive). Missing or empty fails closed at startup |
+| `A2A_SESSION_PREFIX` | no | Session id prefix (default `a2a`) |
+| `A2A_UNIT_NAME` | no | Unit name for journal error inspection (default `a2a-adapter-<harness>@<user>`) |
+
+### Dashboard security & constraints
+
+- **Auth**: The service listens strictly on a unix socket (`A2A_DASH_SOCKET`, no TCP listener) in the user's `0700` private directory. It relies on being reached exclusively through Traefik + forwardAuth (OIDC). It inspects the `X-Forwarded-Email` header passed from forwardAuth against `A2A_DASH_ALLOWED_EMAILS` and returns `403 Forbidden` if missing or unlisted.
+- **XSS & Content Security Policy**: All transcript text and prompts from A2A clients are attacker-influenced; all displayed text is HTML-escaped. The server enforces a strict CSP (`default-src 'none'; style-src 'sha256-...'; frame-ancestors 'none'`).
+- **Read-only**: Accepts `GET` requests only; all other HTTP methods return `405 Method Not Allowed`.
+- **Health check**: `GET /healthz` returns `200 "ok"` without authentication (for smoke/ops).
+- **Transcripts**: Claude Code transcripts are loaded from `~/.claude/projects/<cwd-slug>/<session>.jsonl` with user/assistant text turns and tool-call names (raw tool outputs omitted for privacy/size). For Codex, thread files are managed internally by the Codex CLI, so the dashboard reports "n/a" for transcript files while still listing sessions and running processes.
+- **Journal reading**: Recent errors/warnings from `journalctl -u a2a-adapter-<harness>@<user> -p 4 -n 50` are shown only if the service user belongs to `adm` or `systemd-journal` (or root); otherwise "journal not readable" is safely returned without privilege escalation.
+
+### Dashboard systemd unit
+
+`/etc/systemd/system/a2a-dashboard-claude@.service` (mirroring `a2a-adapter-claude@.service`):
+
+```ini
+[Unit]
+Description=A2A adapter dashboard (claude) for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=%i
+WorkingDirectory=~
+EnvironmentFile=/etc/a2a-adapter/%i-claude.env
+ExecStart=/opt/a2a-adapter/.venv/bin/python -I /opt/a2a-adapter/src/dashboard.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+(For codex, `/etc/systemd/system/a2a-dashboard-codex@.service` points to `/etc/a2a-adapter/%i-codex.env`.)
+
+Offline verification: `python3 dashboard.py --self-check`.
+
 ## Client usage
 
 Do not send an `A2A-Version` header: the `message/send` and `message/stream` method names below are the 0.3 protocol, which is the default when the header is absent; `A2A-Version: 1.0` is rejected with `VersionNotSupportedError`. Only the key gate (`404` without the exact header, `200` with it, for the card and JSON-RPC) is tested, by `test/smoke.py` against a fake adapter. The request bodies here are untested against a live adapter.

@@ -8,3 +8,5 @@
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+__pycache__/
+*.pyc
