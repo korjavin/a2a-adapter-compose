@@ -60,7 +60,7 @@ def request(method="GET", path="/.well-known/agent-card.json", auth=None, body=N
         headers["Content-Type"] = "application/json"
     conn.request(method, path, body=body, headers=headers)
     resp = conn.getresponse()
-    return resp.status, resp.read().decode(errors="replace")
+    return resp.status, resp.read().decode(errors="replace"), resp.getheader("Location")
 
 
 def rpc(method, params=None):
@@ -134,11 +134,18 @@ def main():
         status = request("POST", "/", auth=auth, body=rpc("message/stream"))[0]
         expect(f"SSE stream, {name}: 404", status == 404, status)
     expect("right key, other Host: 404", request(auth=good, host="other.test")[0] == 404)
-    expect("right key over plain HTTP: 404", request(auth=good, tls=False)[0] == 404)
+    # the rig's Traefik has a global web->websecure redirect: http:// must fail loudly, not 301 to https
+    # (python clients keep Authorization on a same-host http->https redirect and would silently work)
+    for path in ("/.well-known/agent-card.json", "/"):
+        status, _, location = request(path=path, auth=good, tls=False)
+        expect(f"right key over plain HTTP {path}: 4xx, no redirect", 400 <= status < 500 and location is None,
+               (status, location))
+    status, _, location = request(auth=good, host="other.test", tls=False)
+    expect("other host over plain HTTP: still redirected", status in (301, 308) and location, (status, location))
 
-    status, body = request(auth=good)
+    status, body, _ = request(auth=good)
     expect("agent card with key: 200 JSON", status == 200 and json.loads(body)["url"] == "https://a2a.test/", body)
-    status, body = request("POST", "/", auth=good, body=rpc("message/send"))
+    status, body, _ = request("POST", "/", auth=good, body=rpc("message/send"))
     expect("JSON-RPC with key: 200", status == 200 and "message/send" in body, body)
 
     conn = http.client.HTTPSConnection("127.0.0.1", 18443, timeout=15, context=ssl._create_unverified_context())
@@ -151,7 +158,7 @@ def main():
            [round(t, 1) for t in times])
 
     if os.environ.get("SMOKE_SLOW", "1") != "0":
-        status, body = request("POST", "/", auth=good, body=rpc("slow", {"seconds": 65}), timeout=90)
+        status, body, _ = request("POST", "/", auth=good, body=rpc("slow", {"seconds": 65}), timeout=90)
         expect("65s request completes", status == 200, (status, body[:200]))
 
     # host unit restart: new socket inode in the same dir, ingress untouched

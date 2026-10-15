@@ -7,6 +7,12 @@ services:
       - --providers.docker.exposedbydefault=false
       - --providers.docker.network=${TRAEFIK_NETWORK_NAME}
       - --entrypoints.web.address=:80
+      # Global web->websecure redirect, entrypoint-level static config as on a
+      # typical core Traefik, with the priority lowered as the README requires:
+      # at its default (MaxInt-1) no user router can win (user max: MaxInt-1000).
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.web.http.redirections.entrypoint.priority=1
       - --entrypoints.websecure.address=:443
     ports:
       - 127.0.0.1:18080:80
