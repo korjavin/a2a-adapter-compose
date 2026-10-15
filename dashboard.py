@@ -73,6 +73,17 @@ EMAIL_HEADER = "X-Auth-Request-Email"
 SECRET_HEADER = "X-A2A-Dash-Secret"
 
 
+def request_email(values: list[str]) -> str | None:
+    """The one identity in the email header, lowercased: None unless exactly one value that is a single
+    printable-ASCII mailbox (no commas, spaces or control chars). Full-string match only, no normalization."""
+    if len(values) != 1:
+        return None
+    email = values[0].strip().lower()
+    if not email or "," in email or any(not 0x21 <= ord(c) <= 0x7e for c in email):
+        return None
+    return email
+
+
 def parse_dash_secret(raw: str) -> str:
     """Same rule as the compose check: lowercase hex, >=32 chars. Fail closed otherwise."""
     if len(raw) < 32 or raw.strip("0123456789abcdef"):
@@ -371,9 +382,12 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def check_auth(self) -> bool:
-        secret = self.headers.get(SECRET_HEADER, "").encode("utf-8", "replace")
-        via_router = bool(self.dash_secret) and hmac.compare_digest(secret, self.dash_secret.encode())
-        email = self.headers.get(EMAIL_HEADER, "").strip().lower()
+        # Exactly one of each (get_all is case-insensitive on names): fail closed on ambiguous duplicates.
+        secrets_ = self.headers.get_all(SECRET_HEADER) or []
+        emails = self.headers.get_all(EMAIL_HEADER) or []
+        via_router = (len(secrets_) == 1 and bool(self.dash_secret)
+                      and hmac.compare_digest(secrets_[0].encode("utf-8", "replace"), self.dash_secret.encode()))
+        email = request_email(emails)
         if not via_router or not email or email not in self.allowed_emails:
             self.send_security_headers(403)
             body = (
@@ -858,9 +872,9 @@ def self_check():
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.connect(sock_path)
             hdrs = [f"{method} {path} HTTP/1.1", "Host: localhost", "Connection: close"]
-            if headers:
-                for k, v in headers.items():
-                    hdrs.append(f"{k}: {v}")
+            # dict, or a list of (name, value) for raw duplicate headers
+            for k, v in (headers.items() if isinstance(headers, dict) else headers or ()):
+                hdrs.append(f"{k}: {v}")
             req_data = "\r\n".join(hdrs) + "\r\n\r\n"
             s.sendall(req_data.encode("utf-8"))
             resp = b""
@@ -886,6 +900,23 @@ def self_check():
         # Test 2a: the email only in X-Forwarded-Email (never set by oauth2-proxy, unstripped by Traefik) -> 403
         st, hdrs, body = request("/", {"X-Forwarded-Email": "alice@example.com", SECRET_HEADER: secret})
         assert st == 403, f"Expected 403 for X-Forwarded-Email, got {st}"
+
+        # Test 2c: ambiguous identity or secret (raw duplicate / mixed-case names, lists, junk) -> 403
+        ok_secret = (SECRET_HEADER, secret)
+        for bad in (
+            [ok_secret, (EMAIL_HEADER, "alice@example.com"), (EMAIL_HEADER, "alice@example.com")],
+            [ok_secret, (EMAIL_HEADER, "alice@example.com"), ("x-auth-request-email", "eve@attacker.com")],
+            [ok_secret, ok_secret, (EMAIL_HEADER, "alice@example.com")],
+            [ok_secret, (SECRET_HEADER.lower(), "f" * 64), (EMAIL_HEADER, "alice@example.com")],
+            [ok_secret, (EMAIL_HEADER, "alice@example.com,eve@attacker.com")],
+            [ok_secret, (EMAIL_HEADER, "alice@example.com\teve")],
+            [ok_secret, (EMAIL_HEADER, "al ice@example.com")],
+            [ok_secret, ("X-Auth-Request-Preferred-Username", "alice@example.com")],
+        ):
+            st, hdrs, body = request("/", bad)
+            assert st == 403, f"Expected 403 for {bad[1:]!r}, got {st}"
+        assert request_email(["  Alice@Example.COM "]) == "alice@example.com"
+        assert request_email(["al\u00efce@example.com"]) is None
 
         # Test 2b: allowlisted email but not via the router (missing / wrong / non-ASCII secret) -> 403
         for bad in (None, "", "f" * 32, secret[:-1], secret + "0", "\u00e9" * 32):

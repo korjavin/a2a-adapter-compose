@@ -6,7 +6,7 @@ import socketserver
 import time
 from http.server import BaseHTTPRequestHandler
 
-from dashboard import EMAIL_HEADER, SECRET_HEADER  # mounted from the repo: the smoke checks the real header names
+from dashboard import EMAIL_HEADER, SECRET_HEADER, request_email  # mounted from the repo: the smoke checks the real header names
 
 SOCK_DIR = "/sock"
 SOCK = os.path.join(SOCK_DIR, "claude.sock")
@@ -93,10 +93,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if self.path == "/healthz":
             return self.send_text(200, "ok")
 
-        if self.headers.get(SECRET_HEADER) != DASH_SECRET:
+        if self.headers.get_all(SECRET_HEADER) != [DASH_SECRET]:
             return self.send_text(403, "forbidden: not via the dashboard router")
-        email = self.headers.get(EMAIL_HEADER, "")
-        if not email or email.lower() not in {e.lower() for e in ALLOWED_EMAILS}:
+        email = request_email(self.headers.get_all(EMAIL_HEADER) or [])  # the real parser
+        if email not in ALLOWED_EMAILS:
             return self.send_text(403, "forbidden")
 
         if self.path == "/":

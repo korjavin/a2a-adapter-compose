@@ -54,17 +54,19 @@ def request(method="GET", path="/.well-known/agent-card.json", auth=None, cookie
                                            context=ssl._create_unverified_context())
     else:
         conn = http.client.HTTPConnection("127.0.0.1", 18080, timeout=timeout)
-    req_headers = {"Host": host}
-    if headers:
-        req_headers.update(headers)
+    # headers: dict, or a list of (name, value) to send raw duplicates
+    req_headers = [("Host", host), *(headers.items() if isinstance(headers, dict) else headers or ())]
     if auth is not None:
-        req_headers["Authorization"] = auth
+        req_headers.append(("Authorization", auth))
     if cookie is not None:
-        req_headers["Cookie"] = cookie
+        req_headers.append(("Cookie", cookie))
     if body is not None:
-        body = json.dumps(body)
-        req_headers["Content-Type"] = "application/json"
-    conn.request(method, path, body=body, headers=req_headers)
+        body = json.dumps(body).encode()
+        req_headers += [("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
+    conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+    for k, v in req_headers:
+        conn.putheader(k, v)
+    conn.endheaders(body)
     resp = conn.getresponse()
     return resp.status, resp.read().decode(errors="replace"), resp.getheader("Location")
 
@@ -253,6 +255,15 @@ def main():
     expect("dash, forged email headers + non-allowlisted cookie: 403", status == 403, status)
     status, _, _ = request(path="/", host=DASH_DOMAIN, cookie="noemail=1", headers=forged)
     expect("dash, forged email headers, auth returns no email: 403", status == 403, status)
+    # raw duplicate / mixed-case copies of the header are dropped and overwritten too
+    dupes = [("X-Auth-Request-Email", "owner@example.com"), ("x-auth-request-email", "owner@example.com")]
+    for cookie, want in ((None, 401), ("dash_auth=intruder@example.com", 403), ("noemail=1", 403)):
+        status, _, _ = request(path="/", host=DASH_DOMAIN, cookie=cookie, headers=dupes)
+        expect(f"dash, duplicate forged email headers, cookie {cookie}: {want}", status == want, status)
+    # an auth response carrying the identity only in old/other headers, or the email twice, is denied
+    for cookie in ("legacy=owner@example.com", "dup=owner@example.com"):
+        status, _, _ = request(path="/", host=DASH_DOMAIN, cookie=cookie)
+        expect(f"dash, auth response {cookie.split('=')[0]}: 403", status == 403, status)
 
     # A neighbour container on the shared Traefik network skips Traefik and forwardAuth by calling the
     # socat bridge directly with a forged email: denied, it cannot know the router-stamped secret.
