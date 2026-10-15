@@ -3,6 +3,7 @@
 import argparse
 import os
 import shlex
+import socket
 import stat
 import subprocess
 import sys
@@ -51,7 +52,13 @@ def clear_stale_socket(path):
         return
     if not stat.S_ISSOCK(mode):
         sys.exit(f"A2A_SOCKET {path!r} exists and is not a socket; refusing to remove it")
-    os.unlink(path)
+    with socket.socket(socket.AF_UNIX) as probe:
+        try:
+            probe.connect(path)
+        except OSError:
+            os.unlink(path)  # nobody listening: stale
+            return
+    sys.exit(f"A2A_SOCKET {path!r} has a live listener; another instance is running?")
 
 
 def main():
@@ -107,7 +114,6 @@ def main():
 
 
 def self_check():
-    import socket
     import tempfile
 
     names = ("A2A_HARNESS", "A2A_YOLO", "A2A_PUBLIC_URL", "A2A_CWD")
@@ -160,6 +166,8 @@ def self_check():
         stale = os.path.join(d, "s.sock")
         s = socket.socket(socket.AF_UNIX)
         s.bind(stale)
+        s.listen()
+        assert exits(clear_stale_socket, stale) and os.path.exists(stale)  # live: keep
         s.close()
         clear_stale_socket(stale)
         assert not os.path.exists(stale)
