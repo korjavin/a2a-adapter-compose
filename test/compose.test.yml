@@ -24,6 +24,8 @@ services:
   fake-host:
     image: python:3.12-alpine@sha256:1b668429b3511ab407d8e00648891631b0b1a4d7e15e3ca70f38ab5b91ad4ab4
     command: ["python", "-u", "/app/dummy_server.py"]
+    environment:
+      A2A_DASH_SECRET: ${A2A_DASH_SECRET:?}
     volumes:
       - ./dummy_server.py:/app/dummy_server.py:ro
       - ${A2A_SOCKET_DIR}:/sock

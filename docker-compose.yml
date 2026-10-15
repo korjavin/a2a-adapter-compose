@@ -86,15 +86,19 @@ services:
       A2A_DASH_DOMAIN: ${A2A_DASH_DOMAIN:-}
       A2A_DASH_SOCKET_NAME: ${A2A_DASH_SOCKET_NAME:-}
       TRAEFIK_FORWARDAUTH_MIDDLEWARE: ${TRAEFIK_FORWARDAUTH_MIDDLEWARE:-}
+      # only read by the format check below, then dropped from socat's env
+      A2A_DASH_SECRET: ${A2A_DASH_SECRET:-}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         case "$$A2A_HARNESS" in claude|codex) ;; *) echo "A2A_HARNESS must be claude or codex" >&2; exit 64;; esac
         [ -n "$$A2A_DASH_DOMAIN" ] || { echo "A2A_DASH_DOMAIN must be set" >&2; exit 64; }
         [ -n "$$TRAEFIK_FORWARDAUTH_MIDDLEWARE" ] || { echo "TRAEFIK_FORWARDAUTH_MIDDLEWARE must be set" >&2; exit 64; }
+        case "$$A2A_DASH_SECRET" in *[!0-9a-f]*|"") echo "A2A_DASH_SECRET must be lowercase hex (openssl rand -hex 32)" >&2; exit 64;; esac
+        [ "$${#A2A_DASH_SECRET}" -ge 32 ] || { echo "A2A_DASH_SECRET must be at least 32 hex chars" >&2; exit 64; }
         DASH_SOCK="$${A2A_DASH_SOCKET_NAME:-$${A2A_HARNESS}-dash.sock}"
         case "$$DASH_SOCK" in */*|..*) echo "A2A_DASH_SOCKET_NAME must be a bare filename" >&2; exit 64;; esac
-        exec socat TCP-LISTEN:9000,fork,reuseaddr "UNIX-CONNECT:/sock/$$DASH_SOCK"
+        exec env -u A2A_DASH_SECRET socat TCP-LISTEN:9000,fork,reuseaddr "UNIX-CONNECT:/sock/$$DASH_SOCK"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/healthz"]
       interval: 10s
@@ -117,7 +121,11 @@ services:
       - traefik.http.routers.${COMPOSE_PROJECT_NAME}-dash.entrypoints=websecure
       - traefik.http.routers.${COMPOSE_PROJECT_NAME}-dash.tls=true
       - traefik.http.routers.${COMPOSE_PROJECT_NAME}-dash.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}
-      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-dash.middlewares=${TRAEFIK_FORWARDAUTH_MIDDLEWARE:-}
+      # forwardAuth first, then stamp the shared secret: dashboard.py refuses requests without it, so a
+      # neighbour container on the Traefik network calling socat :9000 directly (forged X-Forwarded-Email,
+      # no forwardAuth) gets 403. Applied after forwardAuth, so the secret never reaches the auth server.
+      - traefik.http.middlewares.${COMPOSE_PROJECT_NAME}-dash-secret.headers.customrequestheaders.X-A2A-Dash-Secret=${A2A_DASH_SECRET:-}
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-dash.middlewares=${TRAEFIK_FORWARDAUTH_MIDDLEWARE:-},${COMPOSE_PROJECT_NAME}-dash-secret
       - traefik.http.routers.${COMPOSE_PROJECT_NAME}-dash.service=${COMPOSE_PROJECT_NAME}-dash
       - traefik.http.services.${COMPOSE_PROJECT_NAME}-dash.loadbalancer.server.port=9000
       - traefik.http.routers.${COMPOSE_PROJECT_NAME}-dash-http.rule=Host(`${A2A_DASH_DOMAIN:-}`) && !PathPrefix(`/.well-known/acme-challenge/`)

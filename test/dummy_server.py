@@ -54,6 +54,7 @@ class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 
 DASH_SOCK = os.path.join(SOCK_DIR, "claude-dash.sock")
 ALLOWED_EMAILS = {"owner@example.com", "alice@example.com"}
+DASH_SECRET = os.environ["A2A_DASH_SECRET"]  # mirrors dashboard.py: only requests stamped by the Traefik router
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -74,6 +75,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if self.path == "/healthz":
             return self.send_text(200, "ok")
 
+        if self.headers.get("X-A2A-Dash-Secret") != DASH_SECRET:
+            return self.send_text(403, "forbidden: not via the dashboard router")
         email = self.headers.get("X-Forwarded-Email", "")
         if not email or email.lower() not in {e.lower() for e in ALLOWED_EMAILS}:
             return self.send_text(403, "forbidden")
