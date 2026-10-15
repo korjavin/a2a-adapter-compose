@@ -154,12 +154,14 @@ A host-side, read-only HTTP service (`dashboard.py`) showing active sessions, ru
 | `A2A_STATE_DIR` | yes | Existing directory for the session map |
 | `A2A_DASH_SOCKET` | yes | Socket path for the dashboard, e.g. `/var/lib/a2a-adapter/<user>/dash.sock` in the same `0700` socket dir |
 | `A2A_DASH_ALLOWED_EMAILS` | yes | Comma-separated list of allowed emails (case-insensitive). Missing or empty fails closed at startup |
+| `A2A_DASH_SECRET` | yes | `openssl rand -hex 32`, the same value as the Portainer stack's `A2A_DASH_SECRET`. Lowercase hex, at least 32 chars, or startup fails closed |
 | `A2A_SESSION_PREFIX` | no | Session id prefix (default `a2a`) |
 | `A2A_UNIT_NAME` | no | Unit name for journal error inspection (default `a2a-adapter-<harness>@<user>`) |
 
 ### Dashboard security & constraints
 
-- **Auth**: The service listens strictly on a unix socket (`A2A_DASH_SOCKET`, no TCP listener) in the user's `0700` private directory. It relies on being reached exclusively through Traefik + forwardAuth (OIDC). It inspects the `X-Forwarded-Email` header passed from forwardAuth against `A2A_DASH_ALLOWED_EMAILS` and returns `403 Forbidden` if missing or unlisted.
+- **Auth**: The service listens strictly on a unix socket (`A2A_DASH_SOCKET`, no TCP listener) in the user's `0700` private directory. It relies on being reached exclusively through Traefik + forwardAuth (OIDC). It inspects the `X-Forwarded-Email` header passed from forwardAuth against `A2A_DASH_ALLOWED_EMAILS` and returns `403 Forbidden` if missing or unlisted. It also requires `X-A2A-Dash-Secret` to equal `A2A_DASH_SECRET` (constant-time compare, `403` otherwise); only the Traefik dash router sets that header, after forwardAuth. Without it any container on the shared Traefik network could call the socat bridge directly with a forged `X-Forwarded-Email`.
+- **Transcripts are limited to A2A conversations**: `/transcript` serves only session ids present in `<harness>-sessions.json` (`404` otherwise), not every session in the cwd's project dir.
 - **XSS & Content Security Policy**: All transcript text and prompts from A2A clients are attacker-influenced; all displayed text is HTML-escaped. The server enforces a strict CSP (`default-src 'none'; style-src 'sha256-...'; frame-ancestors 'none'`).
 - **Read-only**: Accepts `GET` requests only; all other HTTP methods return `405 Method Not Allowed`.
 - **Health check**: `GET /healthz` returns `200 "ok"` without authentication (for smoke/ops).
@@ -229,6 +231,7 @@ The key must match exactly: case-sensitive `Bearer`, no extra characters, right 
 - **There is no sandbox.** The CLI runs directly on the host with the user's files and credentials. The only host-side gate is the `0700` socket directory (uvicorn makes the socket itself `0666`).
 - **The key is not secret from the box.** It sits in the Traefik router-rule label and the container environment, so anyone who can `docker inspect` or use the Portainer UI can read it. Those users are already root-equivalent (accepted: the env copy only feeds the fail-closed format check). Do not expose a Traefik dashboard/API that would show router rules.
 - **Repeated `Authorization` headers**: Traefik's `Header()` matches if any one value matches, so `Bearer wrong` followed by `Bearer <key>` gets in. Accepted: the exact key is still required, it is not a bypass.
+- **Known open issue: neighbour containers bypass the key gate** (tracked in bead `a2a-tn2`, fix in progress). The key is checked only by Traefik's router rule; the socat bridge listens on `:9000` on the shared external Traefik network and the host adapter does no auth of its own. Any container attached to that network can call `http://<container>:9000/` directly with no key, which is a shell as the host user. Until it is fixed, run only trusted containers on the Traefik network. (The dashboard closes the same hole with a router-stamped secret header, `A2A_DASH_SECRET`.)
 - **One static bearer key**, no rate limiting, no per-client identity or audit trail beyond Traefik logs. Rotate by redeploying.
 - **Mitigations in place**: key format check fails closed; only the one user's socket dir is mounted, read-only; container has no published ports, all capabilities dropped but `CAP_DAC_READ_SEARCH`, read-only rootfs; HTTPS entrypoint only; wrong or missing key gets `404`.
 - To reduce risk set `A2A_YOLO=false` (the CLI then needs approvals it cannot get over A2A, so it will be much less useful) and use a dedicated low-privilege host user outside the `docker` group.
@@ -263,6 +266,7 @@ The stack includes an optional `a2a-dashboard` ingress service bridging Traefik 
   - `COMPOSE_PROFILES=dashboard`: enables the service.
   - `A2A_DASH_DOMAIN`: public hostname for the dashboard (e.g. `dash.example.com`).
   - `TRAEFIK_FORWARDAUTH_MIDDLEWARE`: name of the host's existing Traefik forwardAuth middleware (e.g. `forward-auth@docker`), optionally including `,auth-errors@docker`.
+  - `A2A_DASH_SECRET`: `openssl rand -hex 32`, the same value as in the host dashboard env. A Traefik headers middleware on the dash router (after forwardAuth) sends it as `X-A2A-Dash-Secret`; the container refuses to start (exit 64) unless it is lowercase hex, at least 32 chars. Rotate by changing both and redeploying the stack and restarting the dashboard unit.
   - `A2A_DASH_SOCKET_NAME`: optional, basename of the unix socket in `A2A_SOCKET_DIR` (defaults to `<harness>-dash.sock`).
 - **Hardening & Auth**:
   - Pinned `alpine/socat`, root with only `CAP_DAC_READ_SEARCH` to traverse the `0700` socket dir, read-only rootfs, no published host ports.

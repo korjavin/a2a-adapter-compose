@@ -4,6 +4,7 @@ import base64
 import collections
 import grp
 import hashlib
+import hmac
 import html
 import http.server
 import json
@@ -60,6 +61,18 @@ def parse_allowed_emails(raw: str) -> set[str]:
     if not emails:
         sys.exit("A2A_DASH_ALLOWED_EMAILS contains no valid emails (fail closed)")
     return emails
+
+
+# Set by the Traefik dash router (headers middleware, after forwardAuth). Neighbour containers on the
+# shared Traefik network can reach the socat bridge directly and forge X-Forwarded-Email, but not this.
+SECRET_HEADER = "X-A2A-Dash-Secret"
+
+
+def parse_dash_secret(raw: str) -> str:
+    """Same rule as the compose check: lowercase hex, >=32 chars. Fail closed otherwise."""
+    if len(raw) < 32 or raw.strip("0123456789abcdef"):
+        sys.exit("A2A_DASH_SECRET must be lowercase hex, at least 32 chars (openssl rand -hex 32) (fail closed)")
+    return raw
 
 
 def can_read_journal() -> bool:
@@ -250,7 +263,24 @@ def load_sessions(state_dir: str, harness: str, session_prefix: str = "a2a") -> 
     return results
 
 
-def get_running_processes(harness: str, session_map: dict[str, str], ps_output: str | None = None) -> list[dict]:
+def read_argv(pid: str, cmd: str, proc_root: str = "/proc") -> list[str]:
+    """Real argv from /proc/<pid>/cmdline (NUL-separated); ps args loses boundaries inside a prompt."""
+    try:
+        with open(os.path.join(proc_root, pid, "cmdline"), "rb") as f:
+            raw = f.read()
+        if raw:
+            return raw.rstrip(b"\0").decode("utf-8", "replace").split("\0")
+    except OSError:
+        pass
+    # ponytail: no /proc (macOS dev box, process gone) -> best-effort split, may mismap a prompt with --resume
+    try:
+        return shlex.split(cmd)
+    except ValueError:
+        return cmd.split()
+
+
+def get_running_processes(harness: str, session_map: dict[str, str], ps_output: str | None = None,
+                          proc_root: str = "/proc") -> list[dict]:
     """Find running claude/codex processes for instance user, mapped to conversation."""
     if ps_output is None:
         try:
@@ -278,10 +308,9 @@ def get_running_processes(harness: str, session_map: dict[str, str], ps_output: 
         if len(parts) < 3:
             continue
         pid, etime, cmd = parts[0], parts[1], parts[2]
-        try:
-            argv = shlex.split(cmd)
-        except Exception:
-            argv = cmd.split()
+        if not pid.isdigit():
+            continue
+        argv = read_argv(pid, cmd, proc_root)
         if not argv:
             continue
         prog = argv[0].split("/")[-1]
@@ -320,11 +349,13 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
     cwd: str = ""
     state_dir: str = ""
     allowed_emails: set[str] = set()
+    dash_secret: str = ""
     session_prefix: str = "a2a"
 
     # Injected for testing
     mock_ps_output: str | None = None
     home_dir: str | None = None
+    proc_root: str = "/proc"
 
     def send_security_headers(self, status: int = 200, content_type: str = "text/html; charset=utf-8"):
         self.send_response(status)
@@ -335,14 +366,16 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def check_auth(self) -> bool:
+        secret = self.headers.get(SECRET_HEADER, "").encode("utf-8", "replace")
+        via_router = bool(self.dash_secret) and hmac.compare_digest(secret, self.dash_secret.encode())
         email = self.headers.get("X-Forwarded-Email", "").strip().lower()
-        if not email or email not in self.allowed_emails:
+        if not via_router or not email or email not in self.allowed_emails:
             self.send_security_headers(403)
             body = (
                 "<!DOCTYPE html><html><head><title>403 Forbidden</title>"
                 f"<style>{STYLE_CSS.strip()}</style></head><body>"
                 "<h1>403 Forbidden</h1>"
-                "<p>Access denied: email not authorized by A2A_DASH_ALLOWED_EMAILS.</p>"
+                "<p>Access denied: not via the dashboard router, or email not in A2A_DASH_ALLOWED_EMAILS.</p>"
                 "</body></html>"
             )
             self.wfile.write(body.encode("utf-8"))
@@ -385,7 +418,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
         session_to_ctx = {s["session_id"]: s["context_id"] for s in sessions}
 
         # Running processes
-        running_procs = get_running_processes(self.harness, session_to_ctx, self.mock_ps_output)
+        running_procs = get_running_processes(self.harness, session_to_ctx, self.mock_ps_output, self.proc_root)
         running_sessions = {p["session_id"] for p in running_procs if p["session_id"]}
 
         # Enrich sessions with transcript info
@@ -522,7 +555,11 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
 
         sessions = load_sessions(self.state_dir, self.harness, self.session_prefix)
         session_to_ctx = {s["session_id"]: s["context_id"] for s in sessions}
-        context_id = session_to_ctx.get(session_id, "unknown")
+        context_id = session_to_ctx.get(session_id)
+        if context_id is None:  # only A2A conversations, not every session in the cwd's project dir
+            self.send_security_headers(404)
+            self.wfile.write(b"404 Not Found: session not in the sessions store")
+            return
 
         if self.harness != "claude":
             self.send_security_headers(200)
@@ -620,13 +657,15 @@ class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServe
         self.server_port = 0
 
 
-def run_dashboard(harness: str, cwd: str, state_dir: str, sock: str, allowed_emails: set[str], session_prefix: str = "a2a"):
+def run_dashboard(harness: str, cwd: str, state_dir: str, sock: str, allowed_emails: set[str], dash_secret: str,
+                  session_prefix: str = "a2a"):
     clear_stale_socket(sock)
     handler_cls = DashboardHandler
     handler_cls.harness = harness
     handler_cls.cwd = cwd
     handler_cls.state_dir = state_dir
     handler_cls.allowed_emails = allowed_emails
+    handler_cls.dash_secret = dash_secret
     handler_cls.session_prefix = session_prefix
 
     server = ThreadingUnixHTTPServer(sock, handler_cls)
@@ -670,6 +709,10 @@ def self_check():
     assert exits(parse_allowed_emails, "")
     assert exits(parse_allowed_emails, "   ")
     assert exits(parse_allowed_emails, ",,,")
+    secret = "0123456789abcdef" * 2
+    assert parse_dash_secret(secret) == secret
+    for bad in ("", "ab" * 15, secret.upper(), secret + " ", secret + ",x"):
+        assert exits(parse_dash_secret, bad), bad
 
     # 2. Slug calculation test (non-alphanumeric replacement for dots, underscores, slashes)
     assert get_claude_transcript_slug("/srv/my_repo.v1") == "-srv-my-repo-v1"
@@ -759,19 +802,31 @@ def self_check():
         assert first_p == "First normal prompt for testing", first_p
         assert turns == 2, f"Expected 2 user turns, got {turns}"
 
-        # Verify running process mapping
+        # Verify running process mapping. ps args drops quoting, so a prompt containing "--resume x"
+        # looks like a flag there; the argv boundaries come from <proc_root>/<pid>/cmdline.
+        proc_root = os.path.join(d, "proc")
         fake_ps = (
-            " 1001   00:45 claude -p 'test' --resume session-normal\n"
-            " 1002   00:05 claude -p 'new prompt'\n"
-            " 1003   01:10 bash -c 'sleep 10'\n"
+            " 1001   00:45 claude -p fix --resume session-xss please --resume session-normal\n"
+            " 1002   00:05 claude -p new prompt\n"
+            " 1003   01:10 bash -c sleep 10\n"
         )
-        procs = get_running_processes("claude", {"session-normal": "context-normal"}, fake_ps)
+        for pid, argv in (("1001", ["claude", "-p", "fix --resume session-xss please", "--resume", "session-normal"]),
+                          ("1002", ["claude", "-p", "new prompt"]), ("1003", ["bash", "-c", "sleep 10"])):
+            os.makedirs(os.path.join(proc_root, pid))
+            with open(os.path.join(proc_root, pid, "cmdline"), "wb") as f:
+                f.write("\0".join(argv).encode() + b"\0")
+        ctx_by_session = {"session-normal": "context-normal", "session-xss": "context-xss"}
+        procs = get_running_processes("claude", ctx_by_session, fake_ps, proc_root)
         assert len(procs) == 2, procs
-        assert procs[0]["conversation"] == "context-normal"
+        assert procs[0]["conversation"] == "context-normal", procs[0]
         assert procs[0]["pid"] == "1001"
         assert procs[0]["etime"] == "00:45"
         assert procs[1]["conversation"] == "new"
         assert procs[1]["pid"] == "1002"
+        # no cmdline (non-Linux, process gone): shlex fallback still maps a plain command
+        procs = get_running_processes("claude", ctx_by_session, " 7   00:01 claude -p 'x' --resume session-xss\n",
+                                      os.path.join(d, "noproc"))
+        assert procs[0]["conversation"] == "context-xss", procs
 
         # Start live server on unix socket
         handler_cls = type("TestDashboardHandler", (DashboardHandler,), {
@@ -779,9 +834,11 @@ def self_check():
             "cwd": cwd_dir,
             "state_dir": state_dir,
             "allowed_emails": {"alice@example.com"},
+            "dash_secret": secret,
             "session_prefix": "a2a",
             "home_dir": home_dir,
             "mock_ps_output": fake_ps,
+            "proc_root": proc_root,
         })
 
         clear_stale_socket(sock_path)
@@ -818,11 +875,20 @@ def self_check():
         assert st == 403, f"Expected 403 for missing email header, got {st}"
 
         # Test 2: Non-allowlisted email -> 403
-        st, hdrs, body = request("/", {"X-Forwarded-Email": "eve@attacker.com"})
+        st, hdrs, body = request("/", {"X-Forwarded-Email": "eve@attacker.com", SECRET_HEADER: secret})
         assert st == 403, f"Expected 403 for non-allowlisted email, got {st}"
 
+        # Test 2b: allowlisted email but not via the router (missing / wrong / non-ASCII secret) -> 403
+        for bad in (None, "", "f" * 32, secret[:-1], secret + "0", "\u00e9" * 32):
+            h = {"X-Forwarded-Email": "alice@example.com"}
+            if bad is not None:
+                h[SECRET_HEADER] = bad
+            st, hdrs, body = request("/", h)
+            assert st == 403, f"Expected 403 for secret {bad!r}, got {st}"
+        auth = {"X-Forwarded-Email": "alice@example.com", SECRET_HEADER: secret}
+
         # Test 3: Allowlisted email (case-insensitive) -> 200 OK
-        st, hdrs, body = request("/", {"X-Forwarded-Email": "ALICE@EXAMPLE.COM"})
+        st, hdrs, body = request("/", {"X-Forwarded-Email": "ALICE@EXAMPLE.COM", SECRET_HEADER: secret})
         assert st == 200, f"Expected 200 OK, got {st}"
         assert f"style-src 'sha256-{STYLE_HASH}'" in hdrs, "Missing CSP header with style hash"
         assert "default-src 'none'" in hdrs
@@ -835,23 +901,31 @@ def self_check():
         assert "&lt;script&gt;alert(" in body, "XSS payload not properly escaped in dashboard"
 
         # Test 4: Transcript view for XSS session
-        st, hdrs, body = request("/transcript?session=session-xss", {"X-Forwarded-Email": "alice@example.com"})
+        st, hdrs, body = request("/transcript?session=session-xss", auth)
         assert st == 200, f"Expected 200 for transcript, got {st}"
         assert "<script>" not in body, "Found unescaped <script> tag in transcript body!"
         assert "&lt;script&gt;alert(" in body, "XSS prompt not escaped in transcript"
         assert "&lt;script&gt;badTool&lt;/script&gt;" in body, "XSS tool name not escaped in transcript"
         assert "secret output" not in body, "Raw tool output leaked into transcript view!"
 
+        # Test 4b: a transcript in the same project dir but not in the sessions store -> 404
+        with open(os.path.join(transcript_dir, "session-private.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "user", "message": {"content": "owner's own session"}}) + "\n")
+        st, hdrs, body = request("/transcript?session=session-private", auth)
+        assert st == 404, f"Expected 404 for session outside the store, got {st}"
+        assert "owner's own session" not in body
+
         # Test 5: curl --unix-socket returns the page with allowlisted header
         curl_out = subprocess.check_output([
             "curl", "-s", "--unix-socket", sock_path,
             "-H", "X-Forwarded-Email: alice@example.com",
+            "-H", f"{SECRET_HEADER}: {secret}",
             "http://localhost/"
         ]).decode("utf-8")
         assert "A2A Agent Dashboard" in curl_out, "curl --unix-socket did not return dashboard page"
 
         # Test 6: POST method -> 405 Method Not Allowed (read-only verification)
-        st, hdrs, body = request("/", {"X-Forwarded-Email": "alice@example.com"}, method="POST")
+        st, hdrs, body = request("/", auth, method="POST")
         assert st == 405, f"Expected 405 for POST, got {st}"
 
         # Test 7: GET /healthz unauthenticated -> 200 "ok"
@@ -882,6 +956,7 @@ def main():
     sock = require("A2A_DASH_SOCKET")
     require_private_dir(os.path.dirname(os.path.abspath(sock)))
     allowed_emails = parse_allowed_emails(os.environ.get("A2A_DASH_ALLOWED_EMAILS", ""))
+    dash_secret = parse_dash_secret(os.environ.get("A2A_DASH_SECRET", ""))
     session_prefix = os.environ.get("A2A_SESSION_PREFIX", "a2a")
 
     run_dashboard(
@@ -890,6 +965,7 @@ def main():
         state_dir=state_dir,
         sock=sock,
         allowed_emails=allowed_emails,
+        dash_secret=dash_secret,
         session_prefix=session_prefix,
     )
 

@@ -19,9 +19,10 @@ NET = "a2a_smoke_proxy"
 DOMAIN = "a2a.test"
 DASH_DOMAIN = "a2a-dash.test"
 KEY = secrets.token_hex(32)
+DASH_SECRET = secrets.token_hex(32)
 SOCK_DIR = tempfile.mkdtemp(prefix="a2a-smoke-", dir="/tmp")
 BASE_ENV = dict(os.environ, A2A_HARNESS="claude", A2A_DOMAIN=DOMAIN, A2A_SOCKET_DIR=SOCK_DIR,
-                A2A_API_KEY=KEY, TRAEFIK_NETWORK_NAME=NET)
+                A2A_API_KEY=KEY, A2A_DASH_SECRET=DASH_SECRET, TRAEFIK_NETWORK_NAME=NET)
 failures = []
 
 
@@ -177,12 +178,14 @@ def main():
     dash_env = dict(COMPOSE_PROFILES="dashboard", A2A_DASH_DOMAIN=DASH_DOMAIN,
                     TRAEFIK_FORWARDAUTH_MIDDLEWARE="test-auth@docker")
     # Fail-closed checks on required dashboard env vars
-    for missing_var in ("A2A_DASH_DOMAIN", "TRAEFIK_FORWARDAUTH_MIDDLEWARE"):
-        ingress("up", "-d", **dict(dash_env, **{missing_var: ""}))
+    for missing_var, bad in (("A2A_DASH_DOMAIN", ""), ("TRAEFIK_FORWARDAUTH_MIDDLEWARE", ""),
+                             ("A2A_DASH_SECRET", ""), ("A2A_DASH_SECRET", "CHANGE_ME"),
+                             ("A2A_DASH_SECRET", DASH_SECRET[:31])):
+        ingress("up", "-d", **dict(dash_env, **{missing_var: bad}))
         time.sleep(3)
         state = sh("docker", "inspect", "-f", "{{.State.ExitCode}} {{.State.Health.Status}}",
                    "a2a-smoke-a2a-dashboard-1", check=False).stdout.strip()
-        expect(f"dash container fails closed without {missing_var}", state.split()[:1] == ["64"], state)
+        expect(f"dash container fails closed with {missing_var}={bad!r}", state.split()[:1] == ["64"], state)
 
     ingress("up", "-d", **dash_env)
     expect("dash router up and healthy",
@@ -223,6 +226,23 @@ def main():
     status, _, _ = request(path="/", host=DASH_DOMAIN, cookie="dash_auth=intruder@example.com",
                            headers={"X-Forwarded-Email": "owner@example.com"})
     expect("dash, forged X-Forwarded-Email overridden: 403", status == 403, status)
+
+    # A neighbour container on the shared Traefik network skips Traefik and forwardAuth by calling the
+    # socat bridge directly with a forged email: denied, it cannot know the router-stamped secret.
+    def neighbour(*headers):
+        args = [a for h in headers for a in ("--header", h)]
+        return sh("docker", "run", "--rm", "--network", NET, "--entrypoint", "wget", "alpine/socat:1.8.0.3",
+                  "-q", "-S", "-O", "-", *args, "http://a2a-smoke-a2a-dashboard-1:9000/", check=False)
+    r = neighbour("X-Forwarded-Email: owner@example.com")
+    expect("dash, neighbour direct to socat with forged email: 403", r.returncode != 0 and " 403" in r.stderr,
+           (r.returncode, r.stderr.strip()))
+    r = neighbour("X-Forwarded-Email: owner@example.com", "X-A2A-Dash-Secret: " + secrets.token_hex(32))
+    expect("dash, neighbour direct with a guessed secret: 403", r.returncode != 0 and " 403" in r.stderr,
+           (r.returncode, r.stderr.strip()))
+    # control: the 403s above come from the secret check, not from an unreachable bridge
+    r = neighbour("X-Forwarded-Email: owner@example.com", "X-A2A-Dash-Secret: " + DASH_SECRET)
+    expect("dash, direct with the router secret: 200 (control)", r.returncode == 0 and "dashboard" in r.stdout,
+           (r.returncode, r.stderr.strip()))
 
     # Plain HTTP on dash host: fails loudly (4xx, no Location redirect)
     status, _, location = request(path="/", host=DASH_DOMAIN, cookie="dash_auth=owner@example.com", tls=False)
