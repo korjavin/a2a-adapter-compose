@@ -1,0 +1,75 @@
+# Ingress for one host a2a-adapter instance (a2a-adapter-<harness>@<user>):
+# Traefik (HTTPS only, API-key gate) -> socat :9000 -> /sock/<harness>.sock.
+# No ports: published; only Traefik reaches the container. Env contract: .env.example.
+services:
+  a2a-ingress:
+    image: alpine/socat:1.8.0.3@sha256:beb4a68d9e4fe6b0f21ea774a0fde6c31f580dde6368939ed70100c5385b015e
+    init: true
+    restart: unless-stopped
+    # root, with only CAP_DAC_READ_SEARCH: enough to traverse the user's 0700
+    # socket dir (the socket itself is 0666), nothing else.
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [DAC_READ_SEARCH]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    environment:
+      A2A_HARNESS: ${A2A_HARNESS:?set A2A_HARNESS to claude or codex}
+      # only read by the format check below, then dropped from socat's env
+      A2A_API_KEY: ${A2A_API_KEY:?set A2A_API_KEY (openssl rand -hex 32)}
+    # Fail closed: a key outside [0-9a-f] could inject into the Traefik rule,
+    # so the container (and with it the router) never comes up with one.
+    # No socat timeouts: SSE and long codex runs stay open.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        case "$$A2A_HARNESS" in claude|codex) ;; *) echo "A2A_HARNESS must be claude or codex" >&2; exit 64;; esac
+        case "$$A2A_API_KEY" in *[!0-9a-f]*|"") echo "A2A_API_KEY must be lowercase hex (openssl rand -hex 32)" >&2; exit 64;; esac
+        [ "$${#A2A_API_KEY}" -ge 32 ] || { echo "A2A_API_KEY must be at least 32 hex chars" >&2; exit 64; }
+        exec env -u A2A_API_KEY socat TCP-LISTEN:9000,fork,reuseaddr "UNIX-CONNECT:/sock/$$A2A_HARNESS.sock"
+    # A real HTTP request through the bridge: unhealthy (socket missing, host
+    # unit down) -> Traefik drops the router -> 404, never a dangling route.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9000/.well-known/agent-card.json"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+      start_interval: 2s
+    volumes:
+      # only this user's socket dir, never its parent, home or docker.sock
+      - type: bind
+        source: ${A2A_SOCKET_DIR:?set A2A_SOCKET_DIR, e.g. /var/lib/a2a-adapter/<user>}
+        target: /sock
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [proxy]
+    # Router/service named after the stack, so one Traefik can front several.
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=${TRAEFIK_NETWORK_NAME:-traefik_proxy}
+      # Exact, case-sensitive match on every path (agent card, JSON-RPC, SSE);
+      # anything else falls through to Traefik's 404. websecure only: plain
+      # HTTP never routes here.
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}.rule=Host(`${A2A_DOMAIN:?set A2A_DOMAIN}`) && Header(`Authorization`, `Bearer ${A2A_API_KEY}`)
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}.entrypoints=websecure
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}.tls=true
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}.service=${COMPOSE_PROJECT_NAME}
+      - traefik.http.services.${COMPOSE_PROJECT_NAME}.loadbalancer.server.port=9000
+      # Plain HTTP for this host fails loudly (noop@internal, never forwards)
+      # instead of following a global web->websecure redirect, which would let
+      # an http:// client keep working while sending the key in cleartext.
+      # Wins over router-level redirects and an entrypoint redirect whose
+      # priority was lowered (README); a default-priority entrypoint redirect
+      # still wins, so then nothing changes. ACME HTTP-01 stays reachable.
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-http.rule=Host(`${A2A_DOMAIN}`) && !PathPrefix(`/.well-known/acme-challenge/`)
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-http.entrypoints=web
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-http.priority=2147483647
+      - traefik.http.routers.${COMPOSE_PROJECT_NAME}-http.service=noop@internal
+
+networks:
+  proxy:
+    external: true
+    name: ${TRAEFIK_NETWORK_NAME:-traefik_proxy}

@@ -1,0 +1,35 @@
+# Smoke-test rig (test/smoke.py): a Traefik like the prod one plus a fake host adapter.
+services:
+  traefik:
+    image: traefik:v3.6@sha256:31267173a15b4944e797a76ffd9c419707c8d8b32fe5b610f80cd0cfa05f372d
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=${TRAEFIK_NETWORK_NAME}
+      - --entrypoints.web.address=:80
+      # Global web->websecure redirect, entrypoint-level static config as on a
+      # typical core Traefik, with the priority lowered as the README requires:
+      # at its default (MaxInt-1) no user router can win (user max: MaxInt-1000).
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.web.http.redirections.entrypoint.priority=1
+      - --entrypoints.websecure.address=:443
+    ports:
+      - 127.0.0.1:18080:80
+      - 127.0.0.1:18443:443
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [proxy]
+
+  fake-host:
+    image: python:3.12-alpine@sha256:1b668429b3511ab407d8e00648891631b0b1a4d7e15e3ca70f38ab5b91ad4ab4
+    command: ["python", "-u", "/app/dummy_server.py"]
+    volumes:
+      - ./dummy_server.py:/app/dummy_server.py:ro
+      - ${A2A_SOCKET_DIR}:/sock
+    network_mode: none
+
+networks:
+  proxy:
+    external: true
+    name: ${TRAEFIK_NETWORK_NAME}
