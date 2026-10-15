@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "a2a_adapter_compose",
+  "project_id": "a337bf08-bdda-41ca-9cfc-12caf33ba781"
+}
