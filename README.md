@@ -163,7 +163,7 @@ A host-side, read-only HTTP service (`dashboard.py`) showing active sessions, ru
 
 ### Dashboard security & constraints
 
-- **Auth**: The service listens strictly on a unix socket (`A2A_DASH_SOCKET`, no TCP listener) in the user's `0700` private directory. It relies on being reached exclusively through Traefik + forwardAuth (OIDC). It inspects the `X-Forwarded-Email` header passed from forwardAuth against `A2A_DASH_ALLOWED_EMAILS` and returns `403 Forbidden` if missing or unlisted. It also requires `X-A2A-Dash-Secret` to equal `A2A_DASH_SECRET` (constant-time compare, `403` otherwise); only the Traefik dash router sets that header, after forwardAuth. Without it any container on the shared Traefik network could call the socat bridge directly with a forged `X-Forwarded-Email`.
+- **Auth**: The service listens strictly on a unix socket (`A2A_DASH_SOCKET`, no TCP listener) in the user's `0700` private directory. It relies on being reached exclusively through Traefik + forwardAuth (OIDC). It inspects the `X-Auth-Request-Email` header (what oauth2-proxy's `/oauth2/auth` returns, copied in by the dash router's forwardAuth) against `A2A_DASH_ALLOWED_EMAILS` and returns `403 Forbidden` if missing or unlisted. It also requires `X-A2A-Dash-Secret` to equal `A2A_DASH_SECRET` (constant-time compare, `403` otherwise); only the Traefik dash router sets that header, after forwardAuth. Without it any container on the shared Traefik network could call the socat bridge directly with a forged email header.
 - **Transcripts are limited to A2A conversations**: `/transcript` serves only session ids present in `<harness>-sessions.json` (`404` otherwise), not every session in the cwd's project dir.
 - **XSS & Content Security Policy**: All transcript text and prompts from A2A clients are attacker-influenced; all displayed text is HTML-escaped. The server enforces a strict CSP (`default-src 'none'; style-src 'sha256-...'; frame-ancestors 'none'`).
 - **Read-only**: Accepts `GET` requests only; all other HTTP methods return `405 Method Not Allowed`.
@@ -268,12 +268,13 @@ The stack includes an optional `a2a-dashboard` ingress service bridging Traefik 
 - **Config**:
   - `COMPOSE_PROFILES=dashboard`: enables the service.
   - `A2A_DASH_DOMAIN`: public hostname for the dashboard (e.g. `dash.example.com`).
-  - `TRAEFIK_FORWARDAUTH_MIDDLEWARE`: name of the host's existing Traefik forwardAuth middleware (e.g. `forward-auth@docker`), optionally including `,auth-errors@docker`.
+  - `A2A_DASH_FORWARDAUTH_ADDRESS`: optional, the host oauth2-proxy's auth endpoint as Traefik reaches it on the proxy network. Default `http://oauth2-proxy:4180/oauth2/auth`. The proxy must run with `OAUTH2_PROXY_SET_XAUTHREQUEST=true` so it returns `X-Auth-Request-Email`.
+  - `TRAEFIK_FORWARDAUTH_MIDDLEWARE` is no longer used (ignored if still set): a shared forwardAuth middleware copies whatever `authResponseHeaders` it was given (commonly `X-Forwarded-Email`, which oauth2-proxy never returns), so the dash router defines its own.
   - `A2A_DASH_SECRET`: `openssl rand -hex 32`, the same value as in the host dashboard env. A Traefik headers middleware on the dash router (after forwardAuth) sends it as `X-A2A-Dash-Secret`; the container refuses to start (exit 64) unless it is lowercase hex, at least 32 chars. Rotate by changing both and redeploying the stack and restarting the dashboard unit.
   - `A2A_DASH_SOCKET_NAME`: optional, basename of the unix socket in `A2A_SOCKET_DIR` (defaults to `<harness>-dash.sock`).
 - **Hardening & Auth**:
   - Pinned `alpine/socat`, root with only `CAP_DAC_READ_SEARCH` to traverse the `0700` socket dir, read-only rootfs, no published host ports.
-  - OIDC protection via the host's existing `forwardAuth` middleware. The host service enforces an email allowlist from `X-Forwarded-Email` (which forwardAuth overrides) and returns 403 for unauthorized users.
+  - OIDC protection via the stack's own forwardAuth middleware (`<stack>-dash-auth`) against the host's oauth2-proxy, `trustForwardHeader=true`, `authResponseHeaders=X-Auth-Request-Email`. Listing the header there makes Traefik drop any client-supplied copy before copying the proxy's value, so it cannot be forged through Traefik. The host service enforces the email allowlist on that header and returns 403 for unauthorized users. No login redirect: an unauthenticated request gets the proxy's `401` (sign in at the proxy first).
   - The A2A API bearer key does not grant access to the dashboard, and dashboard OIDC cookies do not grant access to the A2A agent.
   - Plain HTTP requests fail loudly (`noop@internal`, 4xx, no redirect), matching the A2A host router.
   - Container healthcheck probes `GET /healthz` over the unix socket, which returns 200 without auth.
