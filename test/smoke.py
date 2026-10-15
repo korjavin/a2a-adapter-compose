@@ -54,17 +54,19 @@ def request(method="GET", path="/.well-known/agent-card.json", auth=None, cookie
                                            context=ssl._create_unverified_context())
     else:
         conn = http.client.HTTPConnection("127.0.0.1", 18080, timeout=timeout)
-    req_headers = {"Host": host}
-    if headers:
-        req_headers.update(headers)
+    # headers: dict, or a list of (name, value) to send raw duplicates
+    req_headers = [("Host", host), *(headers.items() if isinstance(headers, dict) else headers or ())]
     if auth is not None:
-        req_headers["Authorization"] = auth
+        req_headers.append(("Authorization", auth))
     if cookie is not None:
-        req_headers["Cookie"] = cookie
+        req_headers.append(("Cookie", cookie))
     if body is not None:
-        body = json.dumps(body)
-        req_headers["Content-Type"] = "application/json"
-    conn.request(method, path, body=body, headers=req_headers)
+        body = json.dumps(body).encode()
+        req_headers += [("Content-Type", "application/json"), ("Content-Length", str(len(body)))]
+    conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+    for k, v in req_headers:
+        conn.putheader(k, v)
+    conn.endheaders(body)
     resp = conn.getresponse()
     return resp.status, resp.read().decode(errors="replace"), resp.getheader("Location")
 
@@ -201,11 +203,10 @@ def main():
         expect("65s request completes", status == 200, (status, body[:200]))
 
     # Now enable dashboard profile and verify its validation, hardening, and auth matrix
-    dash_env = dict(COMPOSE_PROFILES="dashboard", A2A_DASH_DOMAIN=DASH_DOMAIN,
-                    TRAEFIK_FORWARDAUTH_MIDDLEWARE="test-auth@docker")
+    # No forwardAuth address: the compose default (http://oauth2-proxy:4180/oauth2/auth) hits the rig's fake.
+    dash_env = dict(COMPOSE_PROFILES="dashboard", A2A_DASH_DOMAIN=DASH_DOMAIN)
     # Fail-closed checks on required dashboard env vars
-    for missing_var, bad in (("A2A_DASH_DOMAIN", ""), ("TRAEFIK_FORWARDAUTH_MIDDLEWARE", ""),
-                             ("A2A_DASH_SECRET", ""), ("A2A_DASH_SECRET", "CHANGE_ME"),
+    for missing_var, bad in (("A2A_DASH_DOMAIN", ""), ("A2A_DASH_SECRET", ""), ("A2A_DASH_SECRET", "CHANGE_ME"),
                              ("A2A_DASH_SECRET", DASH_SECRET[:31])):
         ingress("up", "-d", **dict(dash_env, **{missing_var: bad}))
         time.sleep(3)
@@ -244,25 +245,36 @@ def main():
     status, body, _ = request(path="/.well-known/agent-card.json", host=DOMAIN, cookie="dash_auth=owner@example.com")
     expect("dash cookie on a2a host: 404", status == 404, (status, body))
 
-    # Forged X-Forwarded-Email without cookie -> 401 (cannot bypass forwardAuth)
-    status, _, _ = request(path="/", host=DASH_DOMAIN, headers={"X-Forwarded-Email": "owner@example.com"})
-    expect("dash, forged X-Forwarded-Email without cookie: 401", status == 401, status)
-
-    # Forged X-Forwarded-Email overridden by forwardAuth with non-allowlisted user -> 403
-    status, _, _ = request(path="/", host=DASH_DOMAIN, cookie="dash_auth=intruder@example.com",
-                           headers={"X-Forwarded-Email": "owner@example.com"})
-    expect("dash, forged X-Forwarded-Email overridden: 403", status == 403, status)
+    # Forged email headers (the one dashboard.py reads and the legacy one) cannot bypass forwardAuth or
+    # override the email it returns: listing X-Auth-Request-Email in authResponseHeaders makes Traefik drop
+    # the client's copy even when the auth server returns none (noemail cookie).
+    forged = {"X-Auth-Request-Email": "owner@example.com", "X-Forwarded-Email": "owner@example.com"}
+    status, _, _ = request(path="/", host=DASH_DOMAIN, headers=forged)
+    expect("dash, forged email headers without cookie: 401", status == 401, status)
+    status, _, _ = request(path="/", host=DASH_DOMAIN, cookie="dash_auth=intruder@example.com", headers=forged)
+    expect("dash, forged email headers + non-allowlisted cookie: 403", status == 403, status)
+    status, _, _ = request(path="/", host=DASH_DOMAIN, cookie="noemail=1", headers=forged)
+    expect("dash, forged email headers, auth returns no email: 403", status == 403, status)
+    # raw duplicate / mixed-case copies of the header are dropped and overwritten too
+    dupes = [("X-Auth-Request-Email", "owner@example.com"), ("x-auth-request-email", "owner@example.com")]
+    for cookie, want in ((None, 401), ("dash_auth=intruder@example.com", 403), ("noemail=1", 403)):
+        status, _, _ = request(path="/", host=DASH_DOMAIN, cookie=cookie, headers=dupes)
+        expect(f"dash, duplicate forged email headers, cookie {cookie}: {want}", status == want, status)
+    # an auth response carrying the identity only in old/other headers, or the email twice, is denied
+    for cookie in ("legacy=owner@example.com", "dup=owner@example.com"):
+        status, _, _ = request(path="/", host=DASH_DOMAIN, cookie=cookie)
+        expect(f"dash, auth response {cookie.split('=')[0]}: 403", status == 403, status)
 
     # A neighbour container on the shared Traefik network skips Traefik and forwardAuth by calling the
     # socat bridge directly with a forged email: denied, it cannot know the router-stamped secret.
-    r = neighbour(DASH_URL, "X-Forwarded-Email: owner@example.com")
+    r = neighbour(DASH_URL, "X-Auth-Request-Email: owner@example.com")
     expect("dash, neighbour direct to socat with forged email: 403", r.returncode != 0 and " 403" in r.stderr,
            (r.returncode, r.stderr.strip()))
-    r = neighbour(DASH_URL, "X-Forwarded-Email: owner@example.com", "X-A2A-Dash-Secret: " + secrets.token_hex(32))
+    r = neighbour(DASH_URL, "X-Auth-Request-Email: owner@example.com", "X-A2A-Dash-Secret: " + secrets.token_hex(32))
     expect("dash, neighbour direct with a guessed secret: 403", r.returncode != 0 and " 403" in r.stderr,
            (r.returncode, r.stderr.strip()))
     # control: the 403s above come from the secret check, not from an unreachable bridge
-    r = neighbour(DASH_URL, "X-Forwarded-Email: owner@example.com", "X-A2A-Dash-Secret: " + DASH_SECRET)
+    r = neighbour(DASH_URL, "X-Auth-Request-Email: owner@example.com", "X-A2A-Dash-Secret: " + DASH_SECRET)
     expect("dash, direct with the router secret: 200 (control)", r.returncode == 0 and "dashboard" in r.stdout,
            (r.returncode, r.stderr.strip()))
 

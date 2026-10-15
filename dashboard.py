@@ -63,9 +63,25 @@ def parse_allowed_emails(raw: str) -> set[str]:
     return emails
 
 
+# What oauth2-proxy's /oauth2/auth returns (OAUTH2_PROXY_SET_XAUTHREQUEST=true); the dash router's own
+# forwardAuth lists it in authResponseHeaders, so Traefik drops a client-supplied copy. It does NOT return
+# X-Forwarded-Email (a2a-3c5.7). test/dummy_server.py imports this, so the smoke tests the real name.
+EMAIL_HEADER = "X-Auth-Request-Email"
+
 # Set by the Traefik dash router (headers middleware, after forwardAuth). Neighbour containers on the
-# shared Traefik network can reach the socat bridge directly and forge X-Forwarded-Email, but not this.
+# shared Traefik network can reach the socat bridge directly and forge the email header, but not this.
 SECRET_HEADER = "X-A2A-Dash-Secret"
+
+
+def request_email(values: list[str]) -> str | None:
+    """The one identity in the email header, lowercased: None unless exactly one value that is a single
+    printable-ASCII mailbox (no commas, spaces or control chars). Full-string match only, no normalization."""
+    if len(values) != 1:
+        return None
+    email = values[0].strip().lower()
+    if not email or "," in email or any(not 0x21 <= ord(c) <= 0x7e for c in email):
+        return None
+    return email
 
 
 def parse_dash_secret(raw: str) -> str:
@@ -366,9 +382,12 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def check_auth(self) -> bool:
-        secret = self.headers.get(SECRET_HEADER, "").encode("utf-8", "replace")
-        via_router = bool(self.dash_secret) and hmac.compare_digest(secret, self.dash_secret.encode())
-        email = self.headers.get("X-Forwarded-Email", "").strip().lower()
+        # Exactly one of each (get_all is case-insensitive on names): fail closed on ambiguous duplicates.
+        secrets_ = self.headers.get_all(SECRET_HEADER) or []
+        emails = self.headers.get_all(EMAIL_HEADER) or []
+        via_router = (len(secrets_) == 1 and bool(self.dash_secret)
+                      and hmac.compare_digest(secrets_[0].encode("utf-8", "replace"), self.dash_secret.encode()))
+        email = request_email(emails)
         if not via_router or not email or email not in self.allowed_emails:
             self.send_security_headers(403)
             body = (
@@ -853,9 +872,9 @@ def self_check():
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.connect(sock_path)
             hdrs = [f"{method} {path} HTTP/1.1", "Host: localhost", "Connection: close"]
-            if headers:
-                for k, v in headers.items():
-                    hdrs.append(f"{k}: {v}")
+            # dict, or a list of (name, value) for raw duplicate headers
+            for k, v in (headers.items() if isinstance(headers, dict) else headers or ()):
+                hdrs.append(f"{k}: {v}")
             req_data = "\r\n".join(hdrs) + "\r\n\r\n"
             s.sendall(req_data.encode("utf-8"))
             resp = b""
@@ -870,25 +889,46 @@ def self_check():
             status_code = int(first_line.split()[1])
             return status_code, header_data.decode("latin1"), body.decode("utf-8", errors="replace")
 
-        # Test 1: Missing X-Forwarded-Email -> 403
+        # Test 1: Missing email header -> 403
         st, hdrs, body = request("/")
         assert st == 403, f"Expected 403 for missing email header, got {st}"
 
         # Test 2: Non-allowlisted email -> 403
-        st, hdrs, body = request("/", {"X-Forwarded-Email": "eve@attacker.com", SECRET_HEADER: secret})
+        st, hdrs, body = request("/", {EMAIL_HEADER: "eve@attacker.com", SECRET_HEADER: secret})
         assert st == 403, f"Expected 403 for non-allowlisted email, got {st}"
+
+        # Test 2a: the email only in X-Forwarded-Email (never set by oauth2-proxy, unstripped by Traefik) -> 403
+        st, hdrs, body = request("/", {"X-Forwarded-Email": "alice@example.com", SECRET_HEADER: secret})
+        assert st == 403, f"Expected 403 for X-Forwarded-Email, got {st}"
+
+        # Test 2c: ambiguous identity or secret (raw duplicate / mixed-case names, lists, junk) -> 403
+        ok_secret = (SECRET_HEADER, secret)
+        for bad in (
+            [ok_secret, (EMAIL_HEADER, "alice@example.com"), (EMAIL_HEADER, "alice@example.com")],
+            [ok_secret, (EMAIL_HEADER, "alice@example.com"), ("x-auth-request-email", "eve@attacker.com")],
+            [ok_secret, ok_secret, (EMAIL_HEADER, "alice@example.com")],
+            [ok_secret, (SECRET_HEADER.lower(), "f" * 64), (EMAIL_HEADER, "alice@example.com")],
+            [ok_secret, (EMAIL_HEADER, "alice@example.com,eve@attacker.com")],
+            [ok_secret, (EMAIL_HEADER, "alice@example.com\teve")],
+            [ok_secret, (EMAIL_HEADER, "al ice@example.com")],
+            [ok_secret, ("X-Auth-Request-Preferred-Username", "alice@example.com")],
+        ):
+            st, hdrs, body = request("/", bad)
+            assert st == 403, f"Expected 403 for {bad[1:]!r}, got {st}"
+        assert request_email(["  Alice@Example.COM "]) == "alice@example.com"
+        assert request_email(["al\u00efce@example.com"]) is None
 
         # Test 2b: allowlisted email but not via the router (missing / wrong / non-ASCII secret) -> 403
         for bad in (None, "", "f" * 32, secret[:-1], secret + "0", "\u00e9" * 32):
-            h = {"X-Forwarded-Email": "alice@example.com"}
+            h = {EMAIL_HEADER: "alice@example.com"}
             if bad is not None:
                 h[SECRET_HEADER] = bad
             st, hdrs, body = request("/", h)
             assert st == 403, f"Expected 403 for secret {bad!r}, got {st}"
-        auth = {"X-Forwarded-Email": "alice@example.com", SECRET_HEADER: secret}
+        auth = {EMAIL_HEADER: "alice@example.com", SECRET_HEADER: secret}
 
         # Test 3: Allowlisted email (case-insensitive) -> 200 OK
-        st, hdrs, body = request("/", {"X-Forwarded-Email": "ALICE@EXAMPLE.COM", SECRET_HEADER: secret})
+        st, hdrs, body = request("/", {EMAIL_HEADER: "ALICE@EXAMPLE.COM", SECRET_HEADER: secret})
         assert st == 200, f"Expected 200 OK, got {st}"
         assert f"style-src 'sha256-{STYLE_HASH}'" in hdrs, "Missing CSP header with style hash"
         assert "default-src 'none'" in hdrs
@@ -918,7 +958,7 @@ def self_check():
         # Test 5: curl --unix-socket returns the page with allowlisted header
         curl_out = subprocess.check_output([
             "curl", "-s", "--unix-socket", sock_path,
-            "-H", "X-Forwarded-Email: alice@example.com",
+            "-H", f"{EMAIL_HEADER}: alice@example.com",
             "-H", f"{SECRET_HEADER}: {secret}",
             "http://localhost/"
         ]).decode("utf-8")
