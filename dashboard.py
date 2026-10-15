@@ -351,11 +351,16 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
         self.do_POST()
 
     def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path == "/healthz":
+            self.send_security_headers(200, "text/plain; charset=utf-8")
+            self.wfile.write(b"ok\n")
+            return
+
         if not self.check_auth():
             return
 
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
         if path == "/":
             self.render_dashboard()
         elif path == "/transcript":
@@ -834,6 +839,11 @@ def self_check():
         # Test 6: POST method -> 405 Method Not Allowed (read-only verification)
         st, hdrs, body = request("/", {"X-Forwarded-Email": "alice@example.com"}, method="POST")
         assert st == 405, f"Expected 405 for POST, got {st}"
+
+        # Test 7: GET /healthz unauthenticated -> 200 "ok"
+        st, hdrs, body = request("/healthz")
+        assert st == 200, f"Expected 200 for /healthz unauthenticated, got {st}"
+        assert body.strip() == "ok", f"Expected 'ok' for /healthz, got {body!r}"
 
         server.shutdown()
         server.server_close()

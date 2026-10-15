@@ -1,0 +1,15 @@
+[Unit]
+Description=A2A adapter dashboard (claude) for %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=%i
+WorkingDirectory=~
+EnvironmentFile=/etc/a2a-adapter/%i-claude.env
+ExecStart=/opt/a2a-adapter/.venv/bin/python -I /opt/a2a-adapter/src/dashboard.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

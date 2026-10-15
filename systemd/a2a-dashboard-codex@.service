@@ -1,13 +1,12 @@
 [Unit]
-Description=A2A adapter dashboard for %i
+Description=A2A adapter dashboard (codex) for %i
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 User=%i
 WorkingDirectory=~
-# Reads the same instance environment file (or a sibling dashboard env)
-EnvironmentFile=/etc/a2a-adapter/%i-claude.env
+EnvironmentFile=/etc/a2a-adapter/%i-codex.env
 ExecStart=/opt/a2a-adapter/.venv/bin/python -I /opt/a2a-adapter/src/dashboard.py
 Restart=always
 RestartSec=10
