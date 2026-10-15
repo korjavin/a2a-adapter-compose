@@ -44,6 +44,17 @@ def require_url(name):
     return value
 
 
+def require_private_dir(path):
+    """uvicorn chmods the socket 0666 and A2A_YOLO means shell access: the dir is the only gate."""
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        sys.exit(f"A2A_SOCKET dir {path!r}: {e}")
+    if st.st_uid != os.getuid() or st.st_mode & 0o077:
+        sys.exit(f"A2A_SOCKET dir {path!r} must be owned by this user with mode 0700, "
+                 f"got uid={st.st_uid} mode={stat.S_IMODE(st.st_mode):o}")
+
+
 def clear_stale_socket(path):
     """uvicorn won't bind over an existing path: unlink a leftover socket, refuse anything else."""
     try:
@@ -55,9 +66,11 @@ def clear_stale_socket(path):
     with socket.socket(socket.AF_UNIX) as probe:
         try:
             probe.connect(path)
-        except OSError:
+        except ConnectionRefusedError:
             os.unlink(path)  # nobody listening: stale
             return
+        except OSError as e:
+            sys.exit(f"A2A_SOCKET {path!r} exists and can't be probed ({e}); refusing to remove it")
     sys.exit(f"A2A_SOCKET {path!r} has a live listener; another instance is running?")
 
 
@@ -67,6 +80,7 @@ def main():
     cwd = require_dir("A2A_CWD")
     state_dir = require_dir("A2A_STATE_DIR")
     sock = require("A2A_SOCKET")
+    require_private_dir(os.path.dirname(os.path.abspath(sock)))
     yolo = parse_bool("A2A_YOLO", True)
     timeout = int(os.environ.get("A2A_TIMEOUT", "600"))
     agent_args = shlex.split(os.environ.get("A2A_AGENT_ARGS", ""))
@@ -157,6 +171,12 @@ def self_check():
         assert exits(require_dir, "A2A_CWD")
         env(A2A_CWD=d)
         assert require_dir("A2A_CWD") == d
+
+        os.chmod(d, 0o700)
+        require_private_dir(d)
+        os.chmod(d, 0o750)
+        assert exits(require_private_dir, d)
+        os.chmod(d, 0o700)
 
         plain = os.path.join(d, "plain")
         open(plain, "w").close()
