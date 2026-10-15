@@ -132,6 +132,8 @@ Then create the Portainer stack as above with `A2A_SOCKET_DIR=/var/lib/a2a-adapt
 
 ## Client usage
 
+Do not send an `A2A-Version` header: the `message/send` and `message/stream` method names below are the 0.3 protocol, which is the default when the header is absent; `A2A-Version: 1.0` is rejected with `VersionNotSupportedError`. Only the key gate (`404` without the exact header, `200` with it, for the card and JSON-RPC) is tested, by `test/smoke.py` against a fake adapter. The request bodies here are untested against a live adapter.
+
 Every request, including the agent card, needs the key. Without the exact header Traefik answers `404` (not `401`) so the endpoint does not advertise itself.
 
 ```bash
@@ -139,12 +141,12 @@ export A2A_URL=https://a2a.example.com
 export A2A_API_KEY=...      # the Portainer value
 
 # agent card
-curl -fsS -H "Authorization: Bearer $A2A_API_KEY" -H "A2A-Version: 1.0" \
+curl -fsS -H "Authorization: Bearer $A2A_API_KEY" \
   "$A2A_URL/.well-known/agent-card.json"
 
 # message/send
 curl -fsS -X POST "$A2A_URL/" \
-  -H "Authorization: Bearer $A2A_API_KEY" -H "A2A-Version: 1.0" \
+  -H "Authorization: Bearer $A2A_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"messageId":"m1","role":"user","parts":[{"kind":"text","text":"List the files here."}]}}}'
 ```
@@ -152,7 +154,7 @@ curl -fsS -X POST "$A2A_URL/" \
 Streaming uses `message/stream` on the same URL (server-sent events). Reuse the `contextId` from a reply to continue a conversation. A helper for another agent (hermes-style) is just those two calls with the key kept in a secret store:
 
 ```bash
-a2a() { curl -fsS -X POST "$A2A_URL/" -H "Authorization: Bearer $A2A_API_KEY" -H "A2A-Version: 1.0" \
+a2a() { curl -fsS -X POST "$A2A_URL/" -H "Authorization: Bearer $A2A_API_KEY" \
   -H "Content-Type: application/json" -d "$(jq -n --arg t "$1" \
   '{jsonrpc:"2.0",id:1,method:"message/send",params:{message:{messageId:(now|tostring),role:"user",parts:[{kind:"text",text:$t}]}}}')"; }
 ```
